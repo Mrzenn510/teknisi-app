@@ -342,6 +342,8 @@ var Paho = (function(){
           <div class="scan-hint" id="scanHint">Kamera belum aktif</div>
         </div>
         <button class="btn btn-primary" id="btnStartCam" onclick="startScanner()">▶ Aktifkan Kamera</button>
+        <button class="btn btn-ghost" onclick="document.getElementById('qrImageInput').click()">🖼️ Scan dari Galeri / Gambar</button>
+        <input type="file" id="qrImageInput" accept="image/*" style="display:none;" onchange="scanFromImageFile(event)">
         <button class="btn btn-ghost" onclick="simulateScan()">Simulasikan Scan (Demo/Testing)</button>
       </div>
     </div>
@@ -467,8 +469,9 @@ var Paho = (function(){
     </div>
 
     <button class="btn btn-primary" onclick="window.print()" style="width:100%;margin-bottom:10px;">🖨️ Cetak / Simpan PDF</button>
-    <div class="note" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px;font-size:12px;color:var(--text-dim);line-height:1.6;">
-      <b style="color:var(--text);">Cara scan:</b> buka tab "📷 Scan QR" → aktifkan kamera → arahkan ke QR di atas → perangkat terdeteksi otomatis, langsung lanjut ke flow maintenance.
+    <button class="btn btn-ghost" onclick="switchTab('scan'); document.getElementById('qrImageInput').click();" style="width:100%;">🖼️ Scan dari Galeri / Gambar</button>
+    <div class="note" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px;font-size:12px;color:var(--text-dim);line-height:1.6;margin-top:10px;">
+      <b style="color:var(--text);">Cara scan:</b> buka tab "📷 Scan QR" → aktifkan kamera (atau pakai "Scan dari Galeri" jika QR sudah berupa foto) → arahkan/upload QR di atas → perangkat terdeteksi otomatis, langsung lanjut ke flow maintenance.
     </div>
   </div>
 
@@ -498,6 +501,7 @@ var Paho = (function(){
     <div class="field">
       <label>MQTT Broker (untuk tab Monitoring)</label>
       <input type="text" id="cfgBroker" placeholder="test.mosquitto.org">
+      <div class="field-hint">⚠️ Harus SAMA PERSIS dengan MQTT_SERVER di kode ESP32 (sketch.ino / sketch_hardware_asli.ino). Jika beda, Monitoring tidak akan pernah terhubung ke perangkat walau statusnya "Terhubung ke broker".</div>
     </div>
     <button class="btn btn-primary" onclick="saveSettings()">Simpan Pengaturan</button>
     <button class="btn btn-ghost" onclick="testTelegram()" style="margin-top:8px;">📨 Test Kirim ke Telegram</button>
@@ -528,7 +532,7 @@ let settings = {botToken:'', chatId:'', chatIdOwner:'', broker:'test.mosquitto.o
 let scanState = {qrContent:null, device:null, stream:null, scanning:false, attempt:1};
 let prevStatus = {'AC-001':null, 'TV-001':null}; // untuk deteksi transisi ke FAULT
 
-const STATUS_COLOR = {NORMAL:'var(--ok)', FAULT:'var(--fault)', MAINTENANCE:'var(--maint)', OFF:'var(--off)'};
+const STATUS_COLOR = {NORMAL:'var(--ok)', FAULT:'var(--fault)', MAINTENANCE:'var(--maint)', OFF:'var(--off)', OFFLINE:'var(--off)'};
 
 /* ================= SETTINGS (localStorage - untuk hosting mandiri) ================= */
 async function loadSettings(){
@@ -718,6 +722,22 @@ function connectMqtt(){
     mqttClient.onMessageArrived = (msg)=>{
       const topic = msg.destinationName;
       const payload = msg.payloadString;
+
+      // Topic ketersediaan ESP32 (LWT) -> deteksi putus koneksi SECARA INSTAN,
+      // tanpa harus menunggu timeout "belum ada data" di kartu monitoring.
+      if(topic === 'monitoring/system/availability'){
+        if(payload === 'offline'){
+          Object.keys(DEVICES).forEach(id=>{
+            deviceData[id].status = 'OFFLINE';
+            deviceData[id].power_state = 'OFFLINE';
+            prevStatus[id] = null; // reset supaya saat online lagi, status FAULT (jika ada) tetap ter-notifikasi
+          });
+          document.getElementById('mqttStatusText').textContent = 'Terhubung ke broker, tapi ESP32 offline';
+          renderCards();
+        }
+        return;
+      }
+
       Object.keys(DEVICES).forEach(id=>{
         const base = DEVICES[id].topicBase;
         if(topic === base + '/data'){
@@ -727,7 +747,9 @@ function connectMqtt(){
             if(j.suhu !== undefined) deviceData[id].suhu = j.suhu;
             if(j.status){
               deviceData[id].status = j.status;
-              // Jika abnormal -> FAULT: trigger notifikasi otomatis ke Pemilik & Teknisi
+              // Jika abnormal -> FAULT (sudah dikonfirmasi akurat oleh firmware ESP32
+              // selama beberapa siklus baca berturut-turut sebelum dikirim sebagai FAULT):
+              // trigger notifikasi otomatis ke Pemilik & Teknisi.
               if(j.status === 'FAULT' && prevStatus[id] !== 'FAULT'){
                 sendAutoFaultAlert(id);
               }
@@ -872,6 +894,63 @@ function scanLoop(){
     }
   }
   requestAnimationFrame(scanLoop);
+}
+
+// ── Scan QR dari file gambar (galeri/kamera foto) ──
+function scanFromImageFile(evt){
+  const file = evt.target.files && evt.target.files[0];
+  evt.target.value = ''; // reset supaya bisa pilih file yang sama lagi nanti
+  if(!file) return;
+
+  const hint = document.getElementById('scanHint');
+  hint.textContent = 'Membaca QR dari gambar...';
+
+  const reader = new FileReader();
+  reader.onload = function(e){
+    const img = new Image();
+    img.onload = async function(){
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext('2d', {willReadFrequently:true});
+      ctx.drawImage(img, 0, 0);
+
+      // Prioritas 1: BarcodeDetector (jika didukung browser)
+      if(typeof BarcodeDetector !== 'undefined'){
+        try{
+          const formats = await BarcodeDetector.getSupportedFormats();
+          if(formats.includes('qr_code')){
+            const detector = new BarcodeDetector({formats:['qr_code']});
+            const codes = await detector.detect(canvas);
+            if(codes && codes.length > 0){
+              onQrDetected(codes[0].rawValue);
+              return;
+            }
+          }
+        }catch(err){ /* lanjut ke fallback jsQR */ }
+      }
+      // Fallback: jsQR
+      if(typeof jsQR !== 'undefined'){
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(imgData.data, imgData.width, imgData.height, {inversionAttempts:'attemptBoth'});
+        if(code && code.data){
+          onQrDetected(code.data);
+          return;
+        }
+      }
+      hint.textContent = 'Kamera belum aktif';
+      showToast('❌ QR tidak terbaca dari gambar. Coba foto yang lebih jelas/tidak buram.');
+    };
+    img.onerror = function(){
+      hint.textContent = 'Kamera belum aktif';
+      showToast('❌ Gagal memuat gambar.');
+    };
+    img.src = e.target.result;
+  };
+  reader.onerror = function(){
+    showToast('❌ Gagal membaca file gambar.');
+  };
+  reader.readAsDataURL(file);
 }
 
 function stopScanner(){
