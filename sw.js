@@ -1,7 +1,4 @@
-// Naikkan nomor versi ini SETIAP KALI kamu update index.html / manifest.json
-// dan upload ulang ke hosting (GitHub Pages dll). Ini memaksa browser
-// mengenali service worker sebagai "berubah" dan mengambil versi terbaru.
-const CACHE = 'teknisi-app-v2';
+const CACHE = 'teknisi-app-v1';
 
 // File yang di-cache untuk offline
 const ASSETS = [
@@ -9,19 +6,15 @@ const ASSETS = [
   './manifest.json'
 ];
 
-// Install: cache semua aset (bypass HTTP cache supaya benar-benar fresh)
+// Install: cache semua aset
 self.addEventListener('install', e => {
   e.waitUntil(
-    caches.open(CACHE).then(cache =>
-      Promise.all(ASSETS.map(url =>
-        fetch(url, {cache: 'no-store'}).then(res => cache.put(url, res)).catch(()=>{})
-      ))
-    )
+    caches.open(CACHE).then(cache => cache.addAll(ASSETS))
   );
   self.skipWaiting();
 });
 
-// Activate: hapus SEMUA cache lama (nama versi apapun selain yang aktif sekarang)
+// Activate: hapus cache lama
 self.addEventListener('activate', e => {
   e.waitUntil(
     caches.keys().then(keys =>
@@ -31,12 +24,11 @@ self.addEventListener('activate', e => {
   self.clients.claim();
 });
 
-// Fetch: NETWORK-FIRST untuk file lokal (index.html, manifest, icon) supaya
-// PWA yang sudah ter-install selalu dapat versi terbaru saat online, dan
-// baru pakai cache sebagai fallback kalau benar-benar offline.
+// Fetch: cache-first untuk aset lokal, network-first untuk API eksternal
 self.addEventListener('fetch', e => {
   const url = e.request.url;
 
+  // Selalu network untuk Telegram, MQTT, CDN, Google Fonts — tidak perlu offline
   if(
     url.includes('api.telegram.org') ||
     url.includes('mosquitto.org') ||
@@ -52,19 +44,18 @@ self.addEventListener('fetch', e => {
     return;
   }
 
-  if(e.request.method !== 'GET') return;
-
+  // Cache-first untuk file lokal (index.html, manifest, icon)
   e.respondWith(
-    fetch(e.request, {cache: 'no-store'})
-      .then(res => {
-        if(res && res.status === 200){
+    caches.match(e.request).then(cached => {
+      if(cached) return cached;
+      return fetch(e.request).then(res => {
+        // Cache response baru
+        if(res && res.status === 200 && e.request.method === 'GET'){
           const resClone = res.clone();
           caches.open(CACHE).then(cache => cache.put(e.request, resClone));
         }
         return res;
-      })
-      .catch(() =>
-        caches.match(e.request).then(cached => cached || caches.match('./index.html'))
-      )
+      }).catch(() => caches.match('./index.html'));
+    })
   );
 });

@@ -2,7 +2,7 @@
 <html lang="id">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, viewport-fit=cover">
 <title>Monitoring & Teknisi</title>
 <meta name="description" content="Sistem Monitoring Perangkat Otomatis & Teknisi Lapangan">
 <meta name="theme-color" content="#0a0d10">
@@ -182,7 +182,7 @@ var Paho = (function(){
   }
   *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
   html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:var(--sans);}
-  body{min-height:100vh;padding-bottom:40px;}
+  body{min-height:100vh;padding-bottom:40px;padding-top:env(safe-area-inset-top);padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right);}
   .app{max-width:520px;margin:0 auto;padding:0 14px;}
 
   /* ===== Header ===== */
@@ -209,6 +209,8 @@ var Paho = (function(){
   /* ===== Device Card ===== */
   .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:14px;position:relative;overflow:hidden;}
   .card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--card-color,var(--off));}
+  .card-stale{opacity:.5;filter:grayscale(.5);transition:opacity .3s,filter .3s;}
+  .stale-badge{color:var(--maint);font-weight:700;}
   .card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
   .card-title{display:flex;align-items:center;gap:10px;}
   .indicator{width:14px;height:14px;border-radius:50%;background:var(--card-color,var(--off));box-shadow:0 0 12px var(--card-color,transparent);flex-shrink:0;}
@@ -531,6 +533,7 @@ let deviceData = {
 let settings = {botToken:'', chatId:'', chatIdOwner:'', broker:'test.mosquitto.org'};
 let scanState = {qrContent:null, device:null, stream:null, scanning:false, attempt:1};
 let prevStatus = {'AC-001':null, 'TV-001':null}; // untuk deteksi transisi ke FAULT
+let mqttIsLive = false; // true hanya kalau MQTT benar-benar terhubung ke broker saat ini
 
 const STATUS_COLOR = {NORMAL:'var(--ok)', FAULT:'var(--fault)', MAINTENANCE:'var(--maint)', OFF:'var(--off)', OFFLINE:'var(--off)'};
 
@@ -633,8 +636,9 @@ function renderCards(){
       const pct = Math.min(100, (data.arus / d.maxArus) * 100);
       const daya = (data.arus * 220).toFixed(0);
       const lastUpd = data.lastUpdate ? timeAgo(data.lastUpdate) : 'belum ada data';
+      const staleNote = !mqttIsLive ? ' <span class="stale-badge">⚠ data terakhir, belum terhubung</span>' : '';
       return `
-      <div class="card" id="card-${id}" style="--card-color:${color}">
+      <div class="card${!mqttIsLive ? ' card-stale' : ''}" id="card-${id}" style="--card-color:${color}">
         <div class="card-head">
           <div class="card-title">
             <span class="indicator" id="ind-${id}"></span>
@@ -657,7 +661,7 @@ function renderCards(){
         </div>
         <div class="card-foot">
           <span>ESP32 · MQTT</span>
-          <span id="upd-${id}">update: ${lastUpd}</span>
+          <span id="upd-${id}">update: ${lastUpd}${staleNote}</span>
         </div>
       </div>`;
     }).join('');
@@ -674,14 +678,18 @@ function renderCards(){
     const offset = half - (Math.min(pct,100)/100)*half;
     const daya = (data.arus * 220).toFixed(0);
     const lastUpd = data.lastUpdate ? timeAgo(data.lastUpdate) : 'belum ada data';
+    const staleNote = !mqttIsLive ? ' <span class="stale-badge">⚠ data terakhir, belum terhubung</span>' : '';
 
     // Update gauge arc (animasi CSS transition akan berjalan otomatis)
     const arc = document.getElementById('gauge-arc-'+id);
     if(arc){ arc.style.strokeDashoffset = offset; arc.setAttribute('stroke', color); }
 
-    // Update card border color
+    // Update card border color + tampilan redup kalau bukan data live
     const card = document.getElementById('card-'+id);
-    if(card) card.style.setProperty('--card-color', color);
+    if(card){
+      card.style.setProperty('--card-color', color);
+      card.classList.toggle('card-stale', !mqttIsLive);
+    }
 
     // Update teks
     const el = (s)=>document.getElementById(s+'-'+id);
@@ -691,7 +699,7 @@ function renderCards(){
     if(el('daya'))  el('daya').textContent  = '≈'+daya+'W';
     if(el('pwr'))   el('pwr').textContent   = data.power_state;
     if(el('arus2')) el('arus2').textContent = data.arus.toFixed(2)+'A';
-    if(el('upd'))   el('upd').textContent   = 'update: '+lastUpd;
+    if(el('upd'))   el('upd').innerHTML     = 'update: '+lastUpd+staleNote;
   });
 }
 function timeAgo(ts){
@@ -715,8 +723,10 @@ function connectMqtt(){
     const clientId = 'webapp-' + Math.random().toString(16).slice(2,10);
     mqttClient = new Paho.MQTT.Client(settings.broker, 8081, '/mqtt', clientId);
     mqttClient.onConnectionLost = ()=>{
+      mqttIsLive = false;
       document.getElementById('mqttDot').classList.remove('live');
       document.getElementById('mqttStatusText').textContent = 'Terputus, mencoba lagi...';
+      renderCards();
       setTimeout(connectMqtt, 4000);
     };
     mqttClient.onMessageArrived = (msg)=>{
@@ -768,17 +778,23 @@ function connectMqtt(){
       useSSL:true,
       timeout:8,
       onSuccess:()=>{
+        mqttIsLive = true;
         mqttClient.subscribe('monitoring/#');
         document.getElementById('mqttDot').classList.add('live');
         document.getElementById('mqttStatusText').textContent = 'Terhubung ke ' + settings.broker;
+        renderCards();
       },
       onFailure:()=>{
+        mqttIsLive = false;
         document.getElementById('mqttStatusText').textContent = 'Gagal konek, mencoba lagi...';
+        renderCards();
         setTimeout(connectMqtt, 5000);
       }
     });
   }catch(e){
+    mqttIsLive = false;
     document.getElementById('mqttStatusText').textContent = 'Error: ' + e.message + ' — mencoba lagi...';
+    renderCards();
     setTimeout(connectMqtt, 5000);
   }
 }
@@ -896,6 +912,40 @@ function scanLoop(){
   requestAnimationFrame(scanLoop);
 }
 
+// ── Deteksi QR dari sebuah canvas (coba BarcodeDetector dulu, lalu jsQR) ──
+async function detectQRFromCanvas(canvas){
+  if(typeof BarcodeDetector !== 'undefined'){
+    try{
+      const formats = await BarcodeDetector.getSupportedFormats();
+      if(formats.includes('qr_code')){
+        const detector = new BarcodeDetector({formats:['qr_code']});
+        const codes = await detector.detect(canvas);
+        if(codes && codes.length > 0) return codes[0].rawValue;
+      }
+    }catch(err){ /* lanjut ke fallback jsQR */ }
+  }
+  if(typeof jsQR !== 'undefined'){
+    const ctx = canvas.getContext('2d', {willReadFrequently:true});
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const code = jsQR(imgData.data, imgData.width, imgData.height, {inversionAttempts:'attemptBoth'});
+    if(code && code.data) return code.data;
+  }
+  return null;
+}
+
+// ── Gambar ulang image ke canvas dengan batas dimensi tertentu ──
+function drawToCanvasScaled(img, maxDim){
+  const longest = Math.max(img.naturalWidth, img.naturalHeight);
+  const scale = Math.min(1, maxDim / longest);
+  const w = Math.max(1, Math.round(img.naturalWidth * scale));
+  const h = Math.max(1, Math.round(img.naturalHeight * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d', {willReadFrequently:true});
+  ctx.drawImage(img, 0, 0, w, h);
+  return canvas;
+}
+
 // ── Scan QR dari file gambar (galeri/kamera foto) ──
 function scanFromImageFile(evt){
   const file = evt.target.files && evt.target.files[0];
@@ -909,37 +959,19 @@ function scanFromImageFile(evt){
   reader.onload = function(e){
     const img = new Image();
     img.onload = async function(){
-      const canvas = document.createElement('canvas');
-      canvas.width = img.naturalWidth;
-      canvas.height = img.naturalHeight;
-      const ctx = canvas.getContext('2d', {willReadFrequently:true});
-      ctx.drawImage(img, 0, 0);
-
-      // Prioritas 1: BarcodeDetector (jika didukung browser)
-      if(typeof BarcodeDetector !== 'undefined'){
+      // Foto asli dari kamera HP biasanya beresolusi sangat tinggi (>3000px),
+      // yang justru sering gagal dibaca library QR. Coba beberapa skala,
+      // dari resolusi asli sampai yang lebih kecil, sampai salah satu berhasil.
+      const maxDims = [img.naturalWidth, 1600, 1000, 700, 450];
+      for(const maxDim of maxDims){
         try{
-          const formats = await BarcodeDetector.getSupportedFormats();
-          if(formats.includes('qr_code')){
-            const detector = new BarcodeDetector({formats:['qr_code']});
-            const codes = await detector.detect(canvas);
-            if(codes && codes.length > 0){
-              onQrDetected(codes[0].rawValue);
-              return;
-            }
-          }
-        }catch(err){ /* lanjut ke fallback jsQR */ }
-      }
-      // Fallback: jsQR
-      if(typeof jsQR !== 'undefined'){
-        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const code = jsQR(imgData.data, imgData.width, imgData.height, {inversionAttempts:'attemptBoth'});
-        if(code && code.data){
-          onQrDetected(code.data);
-          return;
-        }
+          const canvas = drawToCanvasScaled(img, maxDim);
+          const result = await detectQRFromCanvas(canvas);
+          if(result){ onQrDetected(result); return; }
+        }catch(err){ /* coba skala berikutnya */ }
       }
       hint.textContent = 'Kamera belum aktif';
-      showToast('❌ QR tidak terbaca dari gambar. Coba foto yang lebih jelas/tidak buram.');
+      showToast('❌ QR tidak terbaca. Pastikan QR mengisi sebagian besar foto, pencahayaan cukup, dan tidak buram/silau.');
     };
     img.onerror = function(){
       hint.textContent = 'Kamera belum aktif';
