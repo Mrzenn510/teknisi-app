@@ -1,0 +1,9 @@
+{
+  "appId": "com.teknisiapp.monitoring",
+  "appName": "Teknisi App",
+  "webDir": "www",
+  "backgroundColor": "#0a0d10",
+  "android": {
+    "allowMixedContent": true
+  }
+}
