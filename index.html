@@ -1,0 +1,1181 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+<title>Monitoring & Teknisi</title>
+<meta name="description" content="Sistem Monitoring Perangkat Otomatis & Teknisi Lapangan">
+<meta name="theme-color" content="#0a0d10">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Teknisi App">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script>
+/* ── jsQR loader dengan 3 CDN fallback ── */
+(function(){
+  var urls = [
+    'https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.js',
+    'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js',
+    'https://unpkg.com/jsqr@1.4.0/dist/jsQR.js'
+  ];
+  var i = 0;
+  function load(){
+    if(i >= urls.length) return;
+    var s = document.createElement('script');
+    s.src = urls[i++];
+    s.onerror = load;
+    document.head.appendChild(s);
+  }
+  load();
+})();
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script>
+/* ── Paho MQTT client minimal (WebSocket) – inline, no CDN needed ── */
+var Paho = (function(){
+  function Client(host, port, path, clientId){
+    this.host = host; this.port = port; this.path = path; this.clientId = clientId;
+    this.onConnectionLost = function(){};
+    this.onMessageArrived  = function(){};
+    this._ws = null; this._connected = false;
+    this._pingInterval = null;
+    this._subscriptions = [];
+  }
+  Client.prototype.connect = function(opts){
+    var self = this;
+    opts = opts || {};
+    var proto = opts.useSSL ? 'wss' : 'ws';
+    var uri  = proto + '://' + self.host + ':' + self.port + self.path;
+    try {
+      var ws = new WebSocket(uri, ['mqtt']);
+      self._ws = ws;
+      ws.binaryType = 'arraybuffer';
+      var timeout = setTimeout(function(){
+        if(ws.readyState !== 1){ ws.close(); if(opts.onFailure) opts.onFailure({errorCode:1,errorMessage:'timeout'}); }
+      }, (opts.timeout||8)*1000);
+      ws.onopen = function(){
+        clearTimeout(timeout);
+        /* kirim CONNECT packet MQTT v3.1.1 */
+        var enc = new TextEncoder();
+        var cid  = enc.encode(self.clientId);
+        var proto_name = [0,4,77,81,84,84]; /* "MQTT" */
+        var var_hdr = proto_name.concat([4,2,0,60]); /* level=4, clean=1, keepalive=60 */
+        var payload = [0,cid.length].concat(Array.from(cid));
+        var rem = var_hdr.length + payload.length;
+        var pkt = [16].concat(_encodeLen(rem)).concat(var_hdr).concat(payload);
+        ws.send(new Uint8Array(pkt));
+        /* tunggu CONNACK */
+        ws._waitConn = true;
+      };
+      ws.onmessage = function(ev){
+        var buf = new Uint8Array(ev.data instanceof ArrayBuffer ? ev.data : ev.data);
+        var type = (buf[0] >> 4);
+        if(type === 2){ /* CONNACK */
+          if(buf[3] === 0){
+            self._connected = true;
+            /* re-subscribe */
+            self._subscriptions.forEach(function(t){ self._doSubscribe(t); });
+            self._pingInterval = setInterval(function(){ self._ping(); },30000);
+            if(opts.onSuccess) opts.onSuccess();
+          } else {
+            if(opts.onFailure) opts.onFailure({errorCode:buf[3]});
+          }
+        } else if(type === 3){ /* PUBLISH */
+          var msg = _parsePublish(buf);
+          if(msg){
+            var m = new Message(msg.payload);
+            m.destinationName = msg.topic;
+            self.onMessageArrived(m);
+          }
+        } else if(type === 13){ /* PINGRESP – ignore */ }
+      };
+      ws.onclose = function(){
+        clearInterval(self._pingInterval);
+        if(self._connected){ self._connected=false; self.onConnectionLost({errorCode:0}); }
+      };
+      ws.onerror = function(){
+        clearTimeout(timeout); clearInterval(self._pingInterval);
+        ws.close();
+        if(opts.onFailure) opts.onFailure({errorCode:1,errorMessage:'ws error'});
+      };
+    } catch(e){
+      if(opts.onFailure) opts.onFailure({errorCode:1,errorMessage:e.message});
+    }
+  };
+  Client.prototype.subscribe = function(topic){
+    this._subscriptions.push(topic);
+    if(this._connected) this._doSubscribe(topic);
+  };
+  Client.prototype._doSubscribe = function(topic){
+    var enc = new TextEncoder();
+    var t = enc.encode(topic);
+    var var_hdr = [0,1]; /* packet id */
+    var payload = [0,t.length].concat(Array.from(t)).concat([0]); /* QoS 0 */
+    var rem = var_hdr.length + payload.length;
+    var pkt = new Uint8Array([130].concat(_encodeLen(rem)).concat(var_hdr).concat(payload));
+    this._ws.send(pkt);
+  };
+  Client.prototype.send = function(topic, payload){
+    var enc = new TextEncoder();
+    var t = enc.encode(topic);
+    var p = enc.encode(payload);
+    var var_hdr = [0,t.length].concat(Array.from(t));
+    var body    = var_hdr.concat(Array.from(p));
+    var pkt = new Uint8Array([48].concat(_encodeLen(body.length)).concat(body));
+    if(this._ws && this._connected) this._ws.send(pkt);
+  };
+  Client.prototype.disconnect = function(){
+    if(this._ws){ this._ws.send(new Uint8Array([0xe0,0])); this._ws.close(); }
+    clearInterval(this._pingInterval); this._connected=false;
+  };
+  Client.prototype._ping = function(){
+    if(this._ws && this._connected) this._ws.send(new Uint8Array([0xc0,0]));
+  };
+
+  function Message(payload){
+    if(typeof payload === 'string') this.payloadString = payload;
+    else { var dec=new TextDecoder(); this.payloadString = dec.decode(payload); }
+  }
+
+  function _encodeLen(n){
+    var out=[];
+    do { var d=n&0x7f; n>>=7; if(n>0)d|=0x80; out.push(d); } while(n>0);
+    return out;
+  }
+  function _parsePublish(buf){
+    try{
+      var i=1, mul=1, rem=0, b;
+      do{ b=buf[i++]; rem+=(b&0x7f)*mul; mul*=128; }while(b&0x80);
+      var tLen=(buf[i]<<8)|buf[i+1]; i+=2;
+      var dec=new TextDecoder();
+      var topic=dec.decode(buf.slice(i,i+tLen)); i+=tLen;
+      var payload=dec.decode(buf.slice(i,i+rem-(2+tLen)));
+      return {topic:topic,payload:payload};
+    }catch(e){return null;}
+  }
+
+  return { MQTT:{ Client:Client, Message:Message } };
+})();
+</script>
+<style>
+  :root{
+    --bg:#0a0d10;
+    --panel:#12171c;
+    --panel-2:#171e25;
+    --border:#232c34;
+    --text:#e7edf2;
+    --text-dim:#8b96a2;
+    --text-faint:#5a6570;
+    --accent:#2dd4c8;
+    --accent-dim:#1a4b47;
+    --ok:#2ecc71;
+    --fault:#ef4444;
+    --maint:#f5b83d;
+    --off:#5b6773;
+    --mono:'JetBrains Mono',monospace;
+    --sans:'Inter',sans-serif;
+    --radius:10px;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:var(--sans);}
+  body{min-height:100vh;padding-bottom:40px;}
+  .app{max-width:520px;margin:0 auto;padding:0 14px;}
+
+  /* ===== Header ===== */
+  .topbar{display:flex;align-items:center;justify-content:space-between;padding:18px 0 10px;}
+  .brand{display:flex;flex-direction:column;gap:2px;}
+  .brand .eyebrow{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;color:var(--accent);text-transform:uppercase;}
+  .brand h1{font-size:17px;margin:0;font-weight:700;letter-spacing:-.01em;}
+  .gear{width:38px;height:38px;border-radius:10px;background:var(--panel);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:17px;color:var(--text-dim);}
+  .gear:active{transform:scale(.94);}
+
+  /* ===== Tabs ===== */
+  .tabs{display:flex;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:4px;gap:4px;margin-bottom:16px;}
+  .tab{flex:1;text-align:center;padding:10px 6px;border-radius:9px;font-size:13px;font-weight:600;color:var(--text-dim);cursor:pointer;user-select:none;transition:.15s;}
+  .tab.active{background:var(--accent-dim);color:var(--accent);}
+  .view{display:none;}
+  .view.active{display:block;animation:fadeIn .2s ease;}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:translateY(0);}}
+
+  /* ===== Legend ===== */
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-family:var(--mono);font-size:10.5px;color:var(--text-dim);margin-bottom:14px;padding:0 2px;}
+  .legend span{display:flex;align-items:center;gap:5px;}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;}
+
+  /* ===== Device Card ===== */
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:14px;position:relative;overflow:hidden;}
+  .card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--card-color,var(--off));}
+  .card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
+  .card-title{display:flex;align-items:center;gap:10px;}
+  .indicator{width:14px;height:14px;border-radius:50%;background:var(--card-color,var(--off));box-shadow:0 0 12px var(--card-color,transparent);flex-shrink:0;}
+  .card-title h3{margin:0;font-size:15px;font-weight:700;}
+  .card-title .room{font-size:11px;color:var(--text-dim);font-family:var(--mono);}
+  .status-pill{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.05em;padding:4px 9px;border-radius:20px;background:var(--card-color,var(--off));color:#08110d;}
+
+  .gauge-row{display:flex;align-items:center;gap:16px;margin-bottom:12px;}
+  .gauge-wrap{width:96px;flex-shrink:0;text-align:center;}
+  .gauge-val{font-family:var(--mono);font-size:15px;font-weight:700;margin-top:-38px;}
+  .gauge-label{font-size:9.5px;color:var(--text-dim);font-family:var(--mono);letter-spacing:.06em;text-transform:uppercase;}
+  .gauge-arc{transition: stroke-dashoffset 0.8s cubic-bezier(.4,0,.2,1), stroke 0.5s ease;}
+
+  .readouts{flex:1;display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+  .ro{background:var(--panel-2);border:1px solid var(--border);border-radius:7px;padding:7px 9px;}
+  .ro-label{font-size:9px;color:var(--text-faint);font-family:var(--mono);text-transform:uppercase;letter-spacing:.06em;}
+  .ro-val{font-family:var(--mono);font-size:13px;font-weight:600;margin-top:2px;}
+  .card-foot{display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--text-faint);border-top:1px solid var(--border);padding-top:9px;}
+
+  .conn-banner{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--text-dim);background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px 12px;margin-bottom:14px;}
+  .conn-dot{width:7px;height:7px;border-radius:50%;background:var(--off);}
+  .conn-dot.live{background:var(--ok);box-shadow:0 0 8px var(--ok);}
+
+  /* ===== QR / Scan flow ===== */
+  .stepper{display:flex;gap:4px;margin-bottom:18px;}
+  .step-dot{flex:1;height:3px;border-radius:2px;background:var(--border);}
+  .step-dot.done{background:var(--accent);}
+
+  .panel-box{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px;text-align:center;}
+  .panel-box h2{font-size:16px;margin:0 0 4px;}
+  .panel-box p{color:var(--text-dim);font-size:12.5px;margin:0 0 16px;line-height:1.5;}
+
+  .scan-frame{width:100%;aspect-ratio:1/1;background:#000;border-radius:12px;overflow:hidden;position:relative;border:1px solid var(--border);margin-bottom:14px;}
+  .scan-frame video, .scan-frame canvas{width:100%;height:100%;object-fit:cover;}
+  .scan-frame canvas{position:absolute;top:0;left:0;visibility:hidden;}
+  .scan-reticle{position:absolute;inset:14%;border:2px solid var(--accent);border-radius:14px;opacity:.85;}
+  .scan-reticle::before,.scan-reticle::after{content:'';position:absolute;width:22px;height:22px;border:3px solid var(--accent);}
+  .scan-hint{position:absolute;bottom:10px;left:0;right:0;text-align:center;font-family:var(--mono);font-size:10.5px;color:#fff;text-shadow:0 1px 3px #000;}
+
+  .btn{display:block;width:100%;padding:14px;border-radius:10px;border:1px solid var(--border);background:var(--panel-2);color:var(--text);font-family:var(--sans);font-size:14px;font-weight:600;cursor:pointer;margin-bottom:10px;transition:.12s;}
+  .btn:active{transform:scale(.98);}
+  .btn-primary{background:var(--accent);color:#06201d;border-color:var(--accent);}
+  .btn-ghost{background:transparent;color:var(--text-dim);}
+  .btn-row{display:flex;gap:10px;}
+  .btn-row .btn{margin-bottom:0;}
+
+  .choice-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:6px;}
+  .choice{background:var(--panel-2);border:1px solid var(--border);border-radius:12px;padding:22px 10px;text-align:center;cursor:pointer;transition:.12s;}
+  .choice:active{transform:scale(.96);border-color:var(--accent);}
+  .choice .ico{font-size:30px;display:block;margin-bottom:8px;}
+  .choice .lbl{font-size:13px;font-weight:700;}
+  .choice .sub{font-size:10.5px;color:var(--text-dim);margin-top:2px;}
+
+  .qr-meta{font-family:var(--mono);font-size:10.5px;color:var(--accent);background:var(--accent-dim);border-radius:6px;padding:8px 10px;margin-bottom:14px;word-break:break-all;text-align:left;}
+
+  .spinner{width:34px;height:34px;border-radius:50%;border:3px solid var(--border);border-top-color:var(--accent);animation:spin .8s linear infinite;margin:6px auto 16px;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+
+  /* Ticket / receipt style preview */
+  .ticket{background:#0e1216;border:1px dashed #2c3640;border-radius:6px;padding:16px;font-family:var(--mono);font-size:11.5px;line-height:1.65;color:#cdd6dd;text-align:left;white-space:pre-wrap;margin-bottom:16px;position:relative;}
+  .ticket-title{color:var(--accent);font-weight:700;}
+
+  .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--panel-2);border:1px solid var(--border);color:var(--text);font-size:12.5px;padding:11px 18px;border-radius:24px;font-family:var(--mono);z-index:99;box-shadow:0 8px 24px rgba(0,0,0,.4);max-width:88%;text-align:center;}
+
+  /* ===== Settings modal ===== */
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-end;justify-content:center;z-index:100;}
+  .overlay.open{display:flex;}
+  .modal{background:var(--panel);width:100%;max-width:520px;border-radius:16px 16px 0 0;padding:20px;border:1px solid var(--border);border-bottom:none;max-height:86vh;overflow-y:auto;}
+  .modal h2{font-size:15px;margin:0 0 14px;}
+  .field{margin-bottom:14px;}
+  .field label{display:block;font-size:11px;color:var(--text-dim);font-family:var(--mono);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;}
+  .field input{width:100%;background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:11px 12px;color:var(--text);font-family:var(--mono);font-size:13px;}
+  .field input:focus{outline:none;border-color:var(--accent);}
+  .field-hint{font-size:10.5px;color:var(--text-faint);margin-top:5px;line-height:1.4;}
+  .modal-close{position:absolute;top:14px;right:16px;color:var(--text-dim);font-size:20px;cursor:pointer;}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="topbar">
+    <div class="brand">
+      <div class="eyebrow">Sistem Monitoring Perangkat Otomatis</div>
+      <h1>Monitoring &amp; Teknisi</h1>
+    </div>
+    <div class="gear" onclick="openSettings()">⚙️</div>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" id="tab-monitoring" onclick="switchTab('monitoring')">📡 Monitoring</div>
+    <div class="tab" id="tab-scan" onclick="switchTab('scan')">📷 Scan QR</div>
+    <div class="tab" id="tab-qris" onclick="switchTab('qris')">🪪 QRIS</div>
+  </div>
+
+  <!-- ================= MONITORING VIEW ================= -->
+  <div class="view active" id="view-monitoring">
+    <div class="conn-banner">
+      <span class="conn-dot" id="mqttDot"></span>
+      <span id="mqttStatusText">Menghubungkan ke broker MQTT...</span>
+    </div>
+
+    <div class="legend">
+      <span><span class="dot" style="background:var(--ok)"></span>Normal</span>
+      <span><span class="dot" style="background:var(--fault)"></span>Fault</span>
+      <span><span class="dot" style="background:var(--maint)"></span>Maintenance</span>
+      <span><span class="dot" style="background:var(--off)"></span>Off</span>
+    </div>
+
+    <div id="deviceCards"></div>
+  </div>
+
+  <!-- ================= SCAN QR VIEW ================= -->
+  <div class="view" id="view-scan">
+    <div class="stepper">
+      <div class="step-dot" id="dot-1"></div>
+      <div class="step-dot" id="dot-2"></div>
+      <div class="step-dot" id="dot-3"></div>
+      <div class="step-dot" id="dot-4"></div>
+      <div class="step-dot" id="dot-5"></div>
+    </div>
+
+    <!-- Step 1: Scan -->
+    <div id="step-scan">
+      <div class="panel-box">
+        <h2>Konfirmasi Kehadiran</h2>
+        <p>Arahkan kamera ke QR code di lokasi perangkat untuk memastikan teknisi sudah berada di tempat.</p>
+        <div class="scan-frame" id="scanFrame">
+          <video id="qrVideo" playsinline muted></video>
+          <canvas id="qrCanvas"></canvas>
+          <div class="scan-reticle" id="reticle" style="display:none;"></div>
+          <div class="scan-hint" id="scanHint">Kamera belum aktif</div>
+        </div>
+        <button class="btn btn-primary" id="btnStartCam" onclick="startScanner()">▶ Aktifkan Kamera</button>
+        <button class="btn btn-ghost" onclick="simulateScan()">Simulasikan Scan (Demo/Testing)</button>
+      </div>
+    </div>
+
+    <!-- Step 2: Device choice -->
+    <div id="step-device" style="display:none;">
+      <div class="panel-box" style="text-align:left;">
+        <h2 style="text-align:center;">Kehadiran Terkonfirmasi ✅</h2>
+        <div class="qr-meta" id="qrMetaText">-</div>
+        <p style="text-align:center;">Perangkat mana yang akan ditangani?</p>
+        <div class="choice-grid">
+          <div class="choice" onclick="chooseDevice('TV')">
+            <span class="ico">📺</span>
+            <span class="lbl">TV-001</span>
+            <span class="sub">Ruang B</span>
+          </div>
+          <div class="choice" onclick="chooseDevice('AC')">
+            <span class="ico">❄️</span>
+            <span class="lbl">AC-001</span>
+            <span class="sub">Ruang A</span>
+          </div>
+        </div>
+        <button class="btn btn-ghost" style="margin-top:14px;" onclick="resetScan()">← Batal, ulangi scan</button>
+      </div>
+    </div>
+
+    <!-- Step 3: Maintenance / Perbaikan -->
+    <div id="step-perbaikan" style="display:none;">
+      <div class="panel-box">
+        <span class="status-pill" style="background:var(--maint);color:#2b1900;display:inline-block;margin-bottom:10px;">🟠 MAINTENANCE</span>
+        <h2 id="perbaikanTitle">Sedang Melakukan Perbaikan</h2>
+        <p id="perbaikanSub">Notifikasi maintenance sudah dikirim. Lakukan perbaikan pada perangkat, lalu lanjut ke tahap diagnostic.</p>
+        <div id="perbaikanSending" style="display:none;">
+          <div class="spinner"></div>
+          <p>Mengirim notifikasi maintenance...</p>
+        </div>
+        <div id="perbaikanReady" style="display:none;">
+          <button class="btn btn-primary" onclick="showStep('diagnostic')">✅ Perbaikan Selesai → Lanjut Diagnostic</button>
+          <button class="btn btn-ghost" onclick="resetScan()">Batalkan</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 4: Diagnostic -->
+    <div id="step-diagnostic" style="display:none;">
+      <div class="panel-box">
+        <span class="status-pill" style="background:#3b82f6;color:#08163a;display:inline-block;margin-bottom:10px;">🔵 DIAGNOSTIC</span>
+        <h2>Hasil Diagnostic</h2>
+        <p>Setelah diperbaiki, bagaimana kondisi perangkat sekarang?</p>
+        <div class="choice-grid">
+          <div class="choice" onclick="chooseDiagnostic('NORMAL')" style="border-color:var(--ok);">
+            <span class="ico">🟢</span>
+            <span class="lbl">Normal</span>
+            <span class="sub">Dapat digunakan</span>
+          </div>
+          <div class="choice" onclick="chooseDiagnostic('FAULT')" style="border-color:var(--fault);">
+            <span class="ico">🔴</span>
+            <span class="lbl">Fault</span>
+            <span class="sub">Perbaikan ulang</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 5: Sending / result -->
+    <div id="step-send" style="display:none;">
+      <div class="panel-box">
+        <div id="sendingState">
+          <h2>Mengirim Notifikasi</h2>
+          <p>Mengambil lokasi &amp; menyusun laporan...</p>
+          <div class="spinner"></div>
+        </div>
+        <div id="resultState" style="display:none;">
+          <h2 id="resultTitle">✅ Terkirim ke Telegram</h2>
+          <div class="ticket" id="ticketPreview"></div>
+          <div id="loopBackBox" style="display:none;">
+            <button class="btn btn-primary" onclick="loopBackToPerbaikan()">🔁 Perbaikan Ulang (Percobaan ke-<span id="attemptNum"></span>)</button>
+          </div>
+          <button class="btn btn-ghost" onclick="resetScan()">Selesai / Scan Lagi</button>
+        </div>
+        <div id="errorState" style="display:none;">
+          <h2>⚠️ Gagal Mengirim</h2>
+          <p id="errorMsg" style="color:var(--fault);margin-bottom:10px;"></p>
+          <div style="background:#151c23;border-radius:8px;padding:12px;font-size:11.5px;color:var(--text-dim);line-height:1.8;margin-bottom:14px;">
+            <b style="color:var(--text);">Cara fix "chat not found":</b><br>
+            1. Buka Telegram → cari bot kamu<br>
+            2. Ketik <b style="color:var(--accent);font-family:var(--mono);">/start</b> ke bot<br>
+            3. Cek Chat ID lewat <b style="color:var(--accent);font-family:var(--mono);">@userinfobot</b><br>
+            4. Update Chat ID di ⚙️ Pengaturan → Test lagi
+          </div>
+          <button class="btn btn-primary" onclick="retrySend()">Coba Lagi</button>
+          <button class="btn btn-ghost" onclick="openSettings()">⚙️ Buka Pengaturan</button>
+          <button class="btn btn-ghost" onclick="resetScan()">Batal</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= QRIS VIEW ================= -->
+  <div class="view" id="view-qris">
+    <div class="panel-box" style="margin-bottom:14px;">
+      <div class="eyebrow" style="margin-bottom:4px;">Checkpoint Lokasi</div>
+      <h2 style="margin:0 0 6px;">QR Code Perangkat</h2>
+      <p style="color:var(--text-dim);font-size:12.5px;margin:0;">Cetak dan tempel QR ini di dekat perangkat. Teknisi scan lewat tab "Scan QR" untuk konfirmasi kehadiran — perangkat akan terdeteksi otomatis.</p>
+    </div>
+
+    <!-- QR AC-001 -->
+    <div class="panel-box" style="margin-bottom:14px;text-align:center;">
+      <div class="eyebrow" style="margin-bottom:2px;">Ruang A</div>
+      <h3 style="margin:2px 0 14px;font-size:16px;">❄️ AC-001</h3>
+      <div id="qr-ac-001" style="display:flex;justify-content:center;margin-bottom:12px;"></div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--text-dim);background:#151c23;border-radius:6px;padding:7px 10px;word-break:break-all;margin-bottom:8px;">TEKNISI-CHECKPOINT:RUANG_A:AC-001</div>
+      <div style="font-size:11px;color:var(--text-dim);">Tempel di dinding dekat unit AC Ruang A</div>
+    </div>
+
+    <!-- QR TV-001 -->
+    <div class="panel-box" style="margin-bottom:14px;text-align:center;">
+      <div class="eyebrow" style="margin-bottom:2px;">Ruang B</div>
+      <h3 style="margin:2px 0 14px;font-size:16px;">📺 TV-001</h3>
+      <div id="qr-tv-001" style="display:flex;justify-content:center;margin-bottom:12px;"></div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--text-dim);background:#151c23;border-radius:6px;padding:7px 10px;word-break:break-all;margin-bottom:8px;">TEKNISI-CHECKPOINT:RUANG_B:TV-001</div>
+      <div style="font-size:11px;color:var(--text-dim);">Tempel di dinding dekat unit TV Ruang B</div>
+    </div>
+
+    <button class="btn btn-primary" onclick="window.print()" style="width:100%;margin-bottom:10px;">🖨️ Cetak / Simpan PDF</button>
+    <div class="note" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 14px;font-size:12px;color:var(--text-dim);line-height:1.6;">
+      <b style="color:var(--text);">Cara scan:</b> buka tab "📷 Scan QR" → aktifkan kamera → arahkan ke QR di atas → perangkat terdeteksi otomatis, langsung lanjut ke flow maintenance.
+    </div>
+  </div>
+
+</div>
+
+<!-- ============ SETTINGS MODAL ============ -->
+<div class="overlay" id="settingsOverlay">
+  <div class="modal">
+    <span class="modal-close" onclick="closeSettings()">✕</span>
+    <h2>Pengaturan</h2>
+
+    <div class="field">
+      <label>Telegram Bot Token</label>
+      <input type="text" id="cfgBotToken" placeholder="123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+      <div class="field-hint">Buat lewat @BotFather di Telegram → /newbot</div>
+    </div>
+    <div class="field">
+      <label>Chat ID Teknisi</label>
+      <input type="text" id="cfgChatId" placeholder="-100xxxxxxxxxx atau ID pribadi">
+      <div class="field-hint">Cek lewat @userinfobot atau @getidsbot di Telegram</div>
+    </div>
+    <div class="field">
+      <label>Chat ID Pemilik</label>
+      <input type="text" id="cfgChatIdOwner" placeholder="-100xxxxxxxxxx atau ID pribadi">
+      <div class="field-hint">Menerima notifikasi otomatis saat status FAULT terdeteksi</div>
+    </div>
+    <div class="field">
+      <label>MQTT Broker (untuk tab Monitoring)</label>
+      <input type="text" id="cfgBroker" placeholder="test.mosquitto.org">
+    </div>
+    <button class="btn btn-primary" onclick="saveSettings()">Simpan Pengaturan</button>
+    <button class="btn btn-ghost" onclick="testTelegram()" style="margin-top:8px;">📨 Test Kirim ke Telegram</button>
+    <div class="field-hint" style="text-align:center;">Data disimpan lokal di perangkat ini saja.</div>
+  </div>
+</div>
+
+<div id="toastBox"></div>
+
+<script>
+/* ================= STATE ================= */
+const DEVICES = {
+  'AC-001': {room:'RUANG_A', label:'AC-001', maxArus:12, hasSuhu:true, topicBase:'monitoring/RUANG_A/AC-001'},
+  'TV-001': {room:'RUANG_B', label:'TV-001', maxArus:4, hasSuhu:false, topicBase:'monitoring/RUANG_B/TV-001'}
+};
+let deviceData = {
+  'AC-001': {arus:0, suhu:null, status:'OFF', power_state:'OFF', lastUpdate:null},
+  'TV-001': {arus:0, suhu:null, status:'OFF', power_state:'OFF', lastUpdate:null}
+};
+// Load data terakhir dari localStorage supaya tidak hilang saat refresh
+(function(){
+  try{
+    const saved = localStorage.getItem('teknisi-device-data');
+    if(saved){ const d = JSON.parse(saved); Object.keys(d).forEach(k=>{ if(deviceData[k]) deviceData[k]=d[k]; }); }
+  }catch(e){}
+})();
+let settings = {botToken:'', chatId:'', chatIdOwner:'', broker:'test.mosquitto.org'};
+let scanState = {qrContent:null, device:null, stream:null, scanning:false, attempt:1};
+let prevStatus = {'AC-001':null, 'TV-001':null}; // untuk deteksi transisi ke FAULT
+
+const STATUS_COLOR = {NORMAL:'var(--ok)', FAULT:'var(--fault)', MAINTENANCE:'var(--maint)', OFF:'var(--off)'};
+
+/* ================= SETTINGS (localStorage - untuk hosting mandiri) ================= */
+async function loadSettings(){
+  try{
+    const raw = localStorage.getItem('teknisi-app-settings');
+    if(raw){ settings = {...settings, ...JSON.parse(raw)}; }
+  }catch(e){ /* belum ada data tersimpan, pakai default */ }
+  document.getElementById('cfgBotToken').value = settings.botToken;
+  document.getElementById('cfgChatId').value = settings.chatId;
+  document.getElementById('cfgChatIdOwner').value = settings.chatIdOwner;
+  document.getElementById('cfgBroker').value = settings.broker;
+}
+async function saveSettings(){
+  settings.botToken = document.getElementById('cfgBotToken').value.trim();
+  settings.chatId = document.getElementById('cfgChatId').value.trim();
+  settings.chatIdOwner = document.getElementById('cfgChatIdOwner').value.trim();
+  settings.broker = document.getElementById('cfgBroker').value.trim() || 'test.mosquitto.org';
+  try{
+    localStorage.setItem('teknisi-app-settings', JSON.stringify(settings));
+    showToast('Pengaturan disimpan ✓');
+    closeSettings();
+    connectMqtt();
+  }catch(e){
+    showToast('Gagal menyimpan pengaturan: ' + e.message);
+  }
+}
+function openSettings(){ document.getElementById('settingsOverlay').classList.add('open'); }
+function closeSettings(){ document.getElementById('settingsOverlay').classList.remove('open'); }
+
+async function testTelegram(){
+  // Ambil nilai dari field input langsung (belum perlu disimpan dulu)
+  const token  = document.getElementById('cfgBotToken').value.trim();
+  const chatId = document.getElementById('cfgChatId').value.trim();
+  if(!token || !chatId){
+    showToast('⚠️ Isi Bot Token & Chat ID Teknisi dulu sebelum test');
+    return;
+  }
+  showToast('📨 Mengirim pesan test...');
+  try{
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({chat_id:chatId, text:'✅ <b>Test berhasil!</b>\nBot Telegram kamu terhubung dengan Teknisi App.', parse_mode:'HTML'})
+    });
+    const data = await res.json();
+    if(data.ok){
+      showToast('✅ Pesan test terkirim! Cek Telegram kamu.');
+    } else {
+      showToast('❌ Gagal: ' + (data.description || 'Token/Chat ID salah'));
+    }
+  }catch(e){
+    showToast('❌ Error: ' + e.message);
+  }
+}
+
+/* ================= TABS ================= */
+function switchTab(name){
+  document.getElementById('tab-monitoring').classList.toggle('active', name==='monitoring');
+  document.getElementById('tab-scan').classList.toggle('active', name==='scan');
+  document.getElementById('tab-qris').classList.toggle('active', name==='qris');
+  document.getElementById('view-monitoring').classList.toggle('active', name==='monitoring');
+  document.getElementById('view-scan').classList.toggle('active', name==='scan');
+  document.getElementById('view-qris').classList.toggle('active', name==='qris');
+  if(name==='qris') generateQRCodes();
+}
+
+/* ================= TOAST ================= */
+function showToast(msg){
+  const box = document.getElementById('toastBox');
+  const el = document.createElement('div');
+  el.className='toast';
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(()=>el.remove(), 3200);
+}
+
+/* ================= GAUGE (SVG) ================= */
+function gaugeSVG(id, pct, color){
+  const r = 34, c = 2*Math.PI*r, half = c/2;
+  const offset = half - (Math.min(pct,100)/100)*half;
+  return `<svg width="96" height="60" viewBox="0 0 96 60">
+    <path d="M 8 52 A 40 40 0 0 1 88 52" fill="none" stroke="#232c34" stroke-width="8" stroke-linecap="round"/>
+    <path id="gauge-arc-${id}" class="gauge-arc" d="M 8 52 A 40 40 0 0 1 88 52" fill="none" stroke="${color}" stroke-width="8" stroke-linecap="round"
+      stroke-dasharray="${half}" stroke-dashoffset="${offset}"/>
+  </svg>`;
+}
+
+/* ================= RENDER MONITORING ================= */
+let cardsBuilt = false;
+function renderCards(){
+  const wrap = document.getElementById('deviceCards');
+  // Pertama kali: build HTML skeleton
+  if(!cardsBuilt){
+    wrap.innerHTML = Object.keys(DEVICES).map(id=>{
+      const d = DEVICES[id];
+      const data = deviceData[id];
+      const color = STATUS_COLOR[data.status] || 'var(--off)';
+      const pct = Math.min(100, (data.arus / d.maxArus) * 100);
+      const daya = (data.arus * 220).toFixed(0);
+      const lastUpd = data.lastUpdate ? timeAgo(data.lastUpdate) : 'belum ada data';
+      return `
+      <div class="card" id="card-${id}" style="--card-color:${color}">
+        <div class="card-head">
+          <div class="card-title">
+            <span class="indicator" id="ind-${id}"></span>
+            <div><h3>${id}</h3><div class="room">${d.room}</div></div>
+          </div>
+          <span class="status-pill" id="pill-${id}">${data.status}</span>
+        </div>
+        <div class="gauge-row">
+          <div class="gauge-wrap">
+            ${gaugeSVG(id, pct, color)}
+            <div class="gauge-val" id="gval-${id}">${data.arus.toFixed(2)}A</div>
+            <div class="gauge-label">Arus</div>
+          </div>
+          <div class="readouts">
+            ${d.hasSuhu ? `<div class="ro"><div class="ro-label">Suhu</div><div class="ro-val" id="suhu-${id}">${data.suhu!==null?data.suhu.toFixed(1)+'°C':'-'}</div></div>` : `<div class="ro"><div class="ro-label">Suhu</div><div class="ro-val">N/A</div></div>`}
+            <div class="ro"><div class="ro-label">Daya</div><div class="ro-val" id="daya-${id}">≈${daya}W</div></div>
+            <div class="ro"><div class="ro-label">Power</div><div class="ro-val" id="pwr-${id}">${data.power_state}</div></div>
+            <div class="ro"><div class="ro-label">Arus</div><div class="ro-val" id="arus2-${id}">${data.arus.toFixed(2)}A</div></div>
+          </div>
+        </div>
+        <div class="card-foot">
+          <span>ESP32 · MQTT</span>
+          <span id="upd-${id}">update: ${lastUpd}</span>
+        </div>
+      </div>`;
+    }).join('');
+    cardsBuilt = true;
+    return;
+  }
+  // Update berikutnya: update elemen in-place (gauge animasi smooth, tidak kedip)
+  Object.keys(DEVICES).forEach(id=>{
+    const d = DEVICES[id];
+    const data = deviceData[id];
+    const color = STATUS_COLOR[data.status] || 'var(--off)';
+    const pct = Math.min(100, (data.arus / d.maxArus) * 100);
+    const r = 34, c = 2*Math.PI*r, half = c/2;
+    const offset = half - (Math.min(pct,100)/100)*half;
+    const daya = (data.arus * 220).toFixed(0);
+    const lastUpd = data.lastUpdate ? timeAgo(data.lastUpdate) : 'belum ada data';
+
+    // Update gauge arc (animasi CSS transition akan berjalan otomatis)
+    const arc = document.getElementById('gauge-arc-'+id);
+    if(arc){ arc.style.strokeDashoffset = offset; arc.setAttribute('stroke', color); }
+
+    // Update card border color
+    const card = document.getElementById('card-'+id);
+    if(card) card.style.setProperty('--card-color', color);
+
+    // Update teks
+    const el = (s)=>document.getElementById(s+'-'+id);
+    if(el('pill'))  el('pill').textContent  = data.status;
+    if(el('gval'))  el('gval').textContent  = data.arus.toFixed(2)+'A';
+    if(el('suhu'))  el('suhu').textContent  = data.suhu!==null ? data.suhu.toFixed(1)+'°C' : '-';
+    if(el('daya'))  el('daya').textContent  = '≈'+daya+'W';
+    if(el('pwr'))   el('pwr').textContent   = data.power_state;
+    if(el('arus2')) el('arus2').textContent = data.arus.toFixed(2)+'A';
+    if(el('upd'))   el('upd').textContent   = 'update: '+lastUpd;
+  });
+}
+function timeAgo(ts){
+  const s = Math.floor((Date.now()-ts)/1000);
+  if(s < 60)  return s+'dtk lalu';
+  if(s < 3600) return Math.floor(s/60)+'m lalu';
+  return Math.floor(s/3600)+'j lalu';
+}
+setInterval(renderCards, 3000);
+
+/* ================= MQTT (Paho, WebSocket) ================= */
+let mqttClient = null;
+function connectMqtt(){
+  // Cek dulu apakah library Paho sudah load
+  if(typeof Paho === 'undefined' || typeof Paho.MQTT === 'undefined'){
+    document.getElementById('mqttStatusText').textContent = 'Memuat library MQTT...';
+    setTimeout(connectMqtt, 1500);
+    return;
+  }
+  try{
+    const clientId = 'webapp-' + Math.random().toString(16).slice(2,10);
+    mqttClient = new Paho.MQTT.Client(settings.broker, 8081, '/mqtt', clientId);
+    mqttClient.onConnectionLost = ()=>{
+      document.getElementById('mqttDot').classList.remove('live');
+      document.getElementById('mqttStatusText').textContent = 'Terputus, mencoba lagi...';
+      setTimeout(connectMqtt, 4000);
+    };
+    mqttClient.onMessageArrived = (msg)=>{
+      const topic = msg.destinationName;
+      const payload = msg.payloadString;
+      Object.keys(DEVICES).forEach(id=>{
+        const base = DEVICES[id].topicBase;
+        if(topic === base + '/data'){
+          try{
+            const j = JSON.parse(payload);
+            deviceData[id].arus = j.arus ?? deviceData[id].arus;
+            if(j.suhu !== undefined) deviceData[id].suhu = j.suhu;
+            if(j.status){
+              deviceData[id].status = j.status;
+              // Jika abnormal -> FAULT: trigger notifikasi otomatis ke Pemilik & Teknisi
+              if(j.status === 'FAULT' && prevStatus[id] !== 'FAULT'){
+                sendAutoFaultAlert(id);
+              }
+              prevStatus[id] = j.status;
+            }
+            if(j.power_state) deviceData[id].power_state = j.power_state;
+            deviceData[id].lastUpdate = Date.now();
+            // Simpan ke localStorage supaya data tidak hilang saat refresh
+            try{ localStorage.setItem('teknisi-device-data', JSON.stringify(deviceData)); }catch(e){}
+          }catch(e){}
+        }
+      });
+      renderCards();
+    };
+    mqttClient.connect({
+      useSSL:true,
+      timeout:8,
+      onSuccess:()=>{
+        mqttClient.subscribe('monitoring/#');
+        document.getElementById('mqttDot').classList.add('live');
+        document.getElementById('mqttStatusText').textContent = 'Terhubung ke ' + settings.broker;
+      },
+      onFailure:()=>{
+        document.getElementById('mqttStatusText').textContent = 'Gagal konek, mencoba lagi...';
+        setTimeout(connectMqtt, 5000);
+      }
+    });
+  }catch(e){
+    document.getElementById('mqttStatusText').textContent = 'Error: ' + e.message + ' — mencoba lagi...';
+    setTimeout(connectMqtt, 5000);
+  }
+}
+
+/* ================= NOTIFIKASI OTOMATIS (Jika Abnormal -> FAULT) ================= */
+async function sendAutoFaultAlert(deviceId){
+  if(!settings.botToken) return; // belum dikonfigurasi, lewati diam-diam
+  const d = DEVICES[deviceId];
+  const data = deviceData[deviceId];
+  const icon = deviceId==='AC-001' ? '❄️' : '📺';
+  const waktu = formatWaktuWIB();
+
+  const text =
+`🚨 <b>${icon} ${deviceId} FAULT DETECTED</b>
+━━━━━━━━━━━━━━━━━━━━━━
+Status     : 🔴 Abnormal - Fault
+Waktu      : ${waktu}
+Arus       : ${data.arus.toFixed(2)} A
+${d.hasSuhu && data.suhu!==null ? `Suhu       : ${data.suhu.toFixed(1)} °C\n` : ''}━━━━━━━━━━━━━━━━━━━━━━
+Notifikasi otomatis dikirim ke Pemilik &amp; Teknisi.
+📟 Device ID: ${deviceId}`;
+
+  const targets = [settings.chatId, settings.chatIdOwner].filter(Boolean);
+  for(const chatId of targets){
+    try{
+      await fetch(`https://api.telegram.org/bot${settings.botToken}/sendMessage`, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({chat_id: chatId, text, parse_mode:'HTML'})
+      });
+    }catch(e){ /* diam-diam gagal, tidak mengganggu UI monitoring */ }
+  }
+  showToast(`🚨 FAULT terdeteksi di ${deviceId} — notifikasi terkirim`);
+}
+
+/* ================= QR SCANNER ================= */
+let _barcodeDetector = null;
+
+async function startScanner(){
+  const video  = document.getElementById('qrVideo');
+  const hint   = document.getElementById('scanHint');
+  const btnCam = document.getElementById('btnStartCam');
+
+  hint.textContent = 'Memulai kamera...';
+  btnCam.style.display = 'none';
+
+  try{
+    scanState.stream = await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode:'environment', width:{ideal:1280}, height:{ideal:720} }
+    });
+    video.srcObject = scanState.stream;
+    video.setAttribute('playsinline','true');
+    await video.play();
+    document.getElementById('reticle').style.display = 'block';
+    hint.textContent = 'Arahkan QR ke kotak...';
+    scanState.scanning = true;
+
+    // Prioritas 1: BarcodeDetector API (native di Chrome Android — cepat & akurat)
+    if(typeof BarcodeDetector !== 'undefined'){
+      try{
+        const formats = await BarcodeDetector.getSupportedFormats();
+        if(formats.includes('qr_code')){
+          _barcodeDetector = new BarcodeDetector({formats:['qr_code']});
+          hint.textContent = '✅ Mode native — arahkan QR ke kotak';
+          nativeScanLoop();
+          return;
+        }
+      }catch(e){}
+    }
+    // Fallback: jsQR via canvas
+    hint.textContent = 'Arahkan QR ke kotak...';
+    requestAnimationFrame(scanLoop);
+  }catch(e){
+    hint.textContent = 'Kamera tidak dapat diakses.';
+    btnCam.style.display = 'block';
+    showToast('Izin kamera ditolak / tidak tersedia: ' + e.message);
+  }
+}
+
+// ── Loop BarcodeDetector native (Android Chrome) ──
+async function nativeScanLoop(){
+  if(!scanState.scanning) return;
+  const video = document.getElementById('qrVideo');
+  try{
+    if(video.readyState >= 2){
+      const codes = await _barcodeDetector.detect(video);
+      if(codes && codes.length > 0){
+        onQrDetected(codes[0].rawValue);
+        return;
+      }
+    }
+  }catch(e){}
+  setTimeout(nativeScanLoop, 150); // check 6-7x per detik
+}
+
+// ── Loop jsQR fallback ──
+function scanLoop(){
+  if(!scanState.scanning) return;
+  const video  = document.getElementById('qrVideo');
+  const canvas = document.getElementById('qrCanvas');
+  if(video.readyState >= 2 && video.videoWidth > 0){
+    canvas.width  = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d', {willReadFrequently:true});
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    if(typeof jsQR !== 'undefined'){
+      const code = jsQR(imgData.data, imgData.width, imgData.height, {inversionAttempts:'attemptBoth'});
+      if(code && code.data){
+        onQrDetected(code.data);
+        return;
+      }
+    }
+  }
+  requestAnimationFrame(scanLoop);
+}
+
+function stopScanner(){
+  scanState.scanning = false;
+  if(scanState.stream){
+    scanState.stream.getTracks().forEach(t=>t.stop());
+    scanState.stream = null;
+  }
+}
+function onQrDetected(content){
+  stopScanner();
+  scanState.qrContent = content;
+  document.getElementById('qrMetaText').textContent = 'QR terbaca: ' + content;
+
+  // Auto-detect device dari format TEKNISI-CHECKPOINT:ROOM:DEVICE_ID
+  const upper = content.toUpperCase();
+  let autoDevice = null;
+  if(upper.includes('AC-001') || upper.includes('AC001')) autoDevice = 'AC';
+  else if(upper.includes('TV-001') || upper.includes('TV001')) autoDevice = 'TV';
+
+  if(autoDevice){
+    // Langsung ke step maintenance, skip pilih manual
+    chooseDevice(autoDevice);
+  } else {
+    // QR tidak dikenal → tampil step pilih device manual
+    showStep('device');
+  }
+}
+function simulateScan(){
+  onQrDetected('LOKASI-CHECKPOINT-01 (simulasi)');
+}
+
+/* ================= FLOW STEPS (Scan -> Perangkat -> Maintenance -> Diagnostic -> Selesai) ================= */
+function showStep(name){
+  ['scan','device','perbaikan','diagnostic','send'].forEach(s=>{
+    document.getElementById('step-'+s).style.display = (s===name)?'block':'none';
+  });
+  const idx = {scan:1, device:2, perbaikan:3, diagnostic:4, send:5}[name];
+  for(let i=1;i<=5;i++){
+    document.getElementById('dot-'+i).classList.toggle('done', i<=idx);
+  }
+}
+
+// Step device dipilih -> masuk status MAINTENANCE, kirim notifikasi maintenance
+async function chooseDevice(device){
+  scanState.device = device;
+  scanState.attempt = 1;
+  showStep('perbaikan');
+  document.getElementById('perbaikanTitle').textContent = 'Sedang Melakukan Perbaikan';
+  document.getElementById('perbaikanSending').style.display='block';
+  document.getElementById('perbaikanReady').style.display='none';
+  await sendMaintenanceStart();
+  document.getElementById('perbaikanSending').style.display='none';
+  document.getElementById('perbaikanReady').style.display='block';
+}
+
+// Setelah "Fault" di diagnostic -> kembali ke step perbaikan (loop, percobaan berikutnya)
+function loopBackToPerbaikan(){
+  scanState.attempt += 1;
+  document.getElementById('perbaikanTitle').textContent = 'Perbaikan Ulang (Percobaan ke-' + scanState.attempt + ')';
+  document.getElementById('perbaikanSub').textContent = 'Perangkat masih Fault setelah diagnostic. Lakukan perbaikan ulang, lalu diagnostic kembali.';
+  document.getElementById('perbaikanReady').style.display='block';
+  document.getElementById('perbaikanSending').style.display='none';
+  showStep('perbaikan');
+}
+
+function chooseDiagnostic(result){
+  showStep('send');
+  document.getElementById('sendingState').style.display='block';
+  document.getElementById('resultState').style.display='none';
+  document.getElementById('errorState').style.display='none';
+  sendDiagnosticResult(result);
+}
+
+/* ================= GENERATE QR CODES (tab QRIS) ================= */
+let qrGenerated = false;
+function generateQRCodes(){
+  if(qrGenerated) return; // hanya generate sekali
+  const items = [
+    {elId:'qr-ac-001', text:'TEKNISI-CHECKPOINT:RUANG_A:AC-001'},
+    {elId:'qr-tv-001', text:'TEKNISI-CHECKPOINT:RUANG_B:TV-001'},
+  ];
+  items.forEach(item=>{
+    const el = document.getElementById(item.elId);
+    if(!el || el.innerHTML.trim()) return; // sudah ada
+    try{
+      // Coba pakai QRCode library jika tersedia
+      if(typeof QRCode !== 'undefined'){
+        new QRCode(el, {text:item.text, width:200, height:200,
+          colorDark:'#0a0d10', colorLight:'#ffffff', correctLevel:QRCode.CorrectLevel.M});
+      } else {
+        // Fallback: pakai QR Server API (tidak butuh library)
+        const img = document.createElement('img');
+        img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(item.text);
+        img.width = 200; img.height = 200;
+        img.style.borderRadius = '8px';
+        el.appendChild(img);
+      }
+    } catch(e){
+      // Fallback API jika QRCode library error
+      const img = document.createElement('img');
+      img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(item.text);
+      img.width = 200; img.height = 200;
+      img.style.borderRadius = '8px';
+      el.appendChild(img);
+    }
+  });
+  qrGenerated = true;
+}
+
+function resetScan(){
+  scanState = {qrContent:null, device:null, stream:null, scanning:false, attempt:1};
+  document.getElementById('scanHint').textContent = 'Kamera belum aktif';
+  document.getElementById('reticle').style.display='none';
+  document.getElementById('btnStartCam').style.display='block';
+  showStep('scan');
+}
+let lastSendFn = null;
+function retrySend(){
+  document.getElementById('sendingState').style.display='block';
+  document.getElementById('resultState').style.display='none';
+  document.getElementById('errorState').style.display='none';
+  if(lastSendFn) lastSendFn();
+}
+
+/* ================= BUILD & SEND NOTIFICATION ================= */
+function formatWaktuWIB(){
+  const bulan = ['Jan','Feb','Mar','Apr','Mei','Jun','Jul','Agu','Sep','Okt','Nov','Des'];
+  const d = new Date(new Date().toLocaleString('en-US', {timeZone:'Asia/Jakarta'}));
+  const dd = String(d.getDate()).padStart(2,'0');
+  const mm = bulan[d.getMonth()];
+  const yyyy = d.getFullYear();
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mi = String(d.getMinutes()).padStart(2,'0');
+  return `${dd} ${mm} ${yyyy}, ${hh}:${mi} WIB`;
+}
+
+async function getLocationInfo(){
+  let lat=null, lon=null, alamat='Tidak tersedia (izin lokasi ditolak)';
+  try{
+    const pos = await new Promise((res,rej)=>{
+      navigator.geolocation.getCurrentPosition(res, rej, {enableHighAccuracy:true, timeout:8000});
+    });
+    lat = pos.coords.latitude;
+    lon = pos.coords.longitude;
+    try{
+      const r = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}`);
+      const j = await r.json();
+      alamat = j.display_name || `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+    }catch(e){ alamat = `${lat.toFixed(4)}, ${lon.toFixed(4)}`; }
+  }catch(e){ /* izin ditolak / gagal ambil GPS */ }
+
+  let ip='Tidak diketahui', isp='-';
+  try{
+    const r = await fetch('https://ipapi.co/json/');
+    const j = await r.json();
+    ip = j.ip || ip;
+    isp = j.org || '-';
+  }catch(e){}
+
+  return {lat, lon, alamat, ip, isp};
+}
+
+function deviceMeta(){
+  const isTV = scanState.device === 'TV';
+  return {
+    icon: isTV ? '📺' : '❄️',
+    nama: isTV ? 'TV' : 'AC',
+    deviceId: isTV ? 'TV-UNIT-001' : 'AC-UNIT-001'
+  };
+}
+
+async function telegramSend(text, chatIds){
+  const res = await fetch(`https://api.telegram.org/bot${settings.botToken}/sendMessage`, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({chat_id: chatIds[0], text, parse_mode:'HTML', disable_web_page_preview:false})
+  });
+  const result = await res.json();
+  if(!result.ok){
+    const desc = result.description || '';
+    let msg = desc;
+    if(desc.includes('chat not found') || desc.includes('not found')){
+      msg = 'Chat ID tidak ditemukan. Pastikan: (1) Chat ID benar, (2) kamu sudah kirim pesan /start ke bot dulu.';
+    } else if(desc.includes('Unauthorized') || desc.includes('unauthorized')){
+      msg = 'Bot Token salah atau sudah expired. Cek token dari @BotFather.';
+    } else if(desc.includes('bot was blocked')){
+      msg = 'Bot diblokir oleh user. Buka chat bot di Telegram lalu klik Unblock / Start.';
+    } else if(desc.includes('parse')){
+      msg = 'Format pesan error: ' + desc;
+    }
+    throw new Error(msg);
+  }
+  // kirim juga ke chat tambahan (Pemilik) tanpa memblokir alur utama jika gagal
+  for(let i=1;i<chatIds.length;i++){
+    if(!chatIds[i]) continue;
+    fetch(`https://api.telegram.org/bot${settings.botToken}/sendMessage`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({chat_id: chatIds[i], text, parse_mode:'HTML'})
+    }).catch(()=>{});
+  }
+}
+
+// ---- Step "Perbaikan": notifikasi MAINTENANCE (dengan lokasi/GPS teknisi) ----
+async function sendMaintenanceStart(){
+  lastSendFn = sendMaintenanceStart;
+  if(!settings.botToken || !settings.chatId){
+    showToast('⚠️ Bot Token / Chat ID belum diisi — notifikasi dilewati. Isi di ⚙️ Pengaturan.');
+    // Tetap tampilkan tombol perbaikan meski notif tidak terkirim
+    document.getElementById('perbaikanSending').style.display='none';
+    document.getElementById('perbaikanReady').style.display='block';
+    return;
+  }
+  const m = deviceMeta();
+  try{
+    const info = await getLocationInfo();
+    const waktu = formatWaktuWIB();
+    const gmapsLink = (info.lat && info.lon) ? `https://www.google.com/maps?q=${info.lat},${info.lon}` : null;
+    const gpsLine = (info.lat && info.lon)
+      ? `${Math.abs(info.lat).toFixed(4)}° ${info.lat>=0?'N':'S'}, ${Math.abs(info.lon).toFixed(4)}° ${info.lon>=0?'E':'W'}`
+      : 'Tidak tersedia';
+
+    const text =
+`${m.icon} <b>${m.nama} MAINTENANCE NOTIFICATION</b>
+━━━━━━━━━━━━━━━━━━━━━━
+Status     : 🟠 Maintenance - Perbaikan Dimulai
+Waktu      : ${waktu}
+━━━━━━━━━━━━━━━━━━━━━━
+📍 Lokasi  : ${info.alamat}
+🌐 IP      : ${info.ip} (ISP: ${info.isp})
+🗺️ GPS     : ${gpsLine}
+${gmapsLink ? `<a href="${gmapsLink}">Buka di Maps</a>` : ''}
+━━━━━━━━━━━━━━━━━━━━━━
+👨‍🔧 Teknisi  : Auto-detected
+📟 Device ID: ${m.deviceId}`;
+
+    await telegramSend(text, [settings.chatId, settings.chatIdOwner]);
+    showToast('🟠 Notifikasi maintenance terkirim ke Telegram ✓');
+  }catch(e){
+    showToast('⚠️ Gagal kirim notifikasi: ' + e.message);
+  } finally {
+    // Selalu tampilkan tombol, apapun hasilnya
+    document.getElementById('perbaikanSending').style.display='none';
+    document.getElementById('perbaikanReady').style.display='block';
+  }
+}
+
+// ---- Step "Diagnostic": notifikasi hasil akhir (Normal/Dapat Digunakan atau Fault/Perbaikan Ulang) ----
+async function sendDiagnosticResult(result){
+  lastSendFn = ()=>sendDiagnosticResult(result);
+  const m = deviceMeta();
+  const waktu = formatWaktuWIB();
+  const statusLine = result==='NORMAL' ? '🟢 Normal - Dapat Digunakan' : '🔴 Fault - Perbaikan Ulang Diperlukan';
+
+  const text =
+`${m.icon} <b>${m.nama} DIAGNOSTIC NOTIFICATION</b>
+━━━━━━━━━━━━━━━━━━━━━━
+Status     : ${statusLine}
+Waktu      : ${waktu}
+Percobaan  : ke-${scanState.attempt}
+━━━━━━━━━━━━━━━━━━━━━━
+👨‍🔧 Teknisi  : Auto-detected
+📟 Device ID: ${m.deviceId}`;
+
+  const plain = text.replace(/<\/?b>/g,'');
+
+  try{
+    if(settings.botToken && settings.chatId){
+      await telegramSend(text, [settings.chatId, settings.chatIdOwner]);
+    } else {
+      showToast('⚠️ Notifikasi tidak terkirim — isi Bot Token di ⚙️ Pengaturan');
+    }
+    document.getElementById('sendingState').style.display='none';
+    document.getElementById('resultState').style.display='block';
+    document.getElementById('ticketPreview').textContent = plain;
+    document.getElementById('resultTitle').textContent = result==='NORMAL' ? '✅ Selesai - Dapat Digunakan' : '🔁 Fault - Perlu Perbaikan Ulang';
+    document.getElementById('loopBackBox').style.display = result==='FAULT' ? 'block' : 'none';
+    document.getElementById('attemptNum').textContent = scanState.attempt + 1;
+  }catch(e){
+    showError('Gagal mengirim: ' + e.message);
+  }
+}
+function showError(text){
+  document.getElementById('sendingState').style.display='none';
+  document.getElementById('errorState').style.display='block';
+  document.getElementById('errorMsg').textContent = text;
+}
+
+/* ================= INIT ================= */
+(async function init(){
+  await loadSettings();
+  connectMqtt();
+  renderCards();
+})();
+</script>
+<script>
+// Register Service Worker untuk PWA / offline support
+if('serviceWorker' in navigator){
+  window.addEventListener('load', ()=>{
+    navigator.serviceWorker.register('sw.js')
+      .then(()=> console.log('SW registered'))
+      .catch(e=> console.log('SW error:', e));
+  });
+}
+</script>
+</body>
+</html>
