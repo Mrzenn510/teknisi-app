@@ -59,12 +59,29 @@ var Paho = (function(){
       }, (opts.timeout||8)*1000);
       ws.onopen = function(){
         clearTimeout(timeout);
-        /* kirim CONNECT packet MQTT v3.1.1 */
+        /* kirim CONNECT packet MQTT v3.1.1 (dengan dukungan username/password opsional) */
         var enc = new TextEncoder();
         var cid  = enc.encode(self.clientId);
         var proto_name = [0,4,77,81,84,84]; /* "MQTT" */
-        var var_hdr = proto_name.concat([4,2,0,60]); /* level=4, clean=1, keepalive=60 */
+
+        var hasUser = !!(opts.userName && opts.userName.length);
+        var hasPass = !!(opts.password && opts.password.length);
+        var flags = 2; /* clean session = 1 (bit1) */
+        if(hasUser) flags |= 0x80;
+        if(hasPass) flags |= 0x40;
+
+        var var_hdr = proto_name.concat([4, flags, 0, 60]); /* level=4, keepalive=60 */
+
         var payload = [0,cid.length].concat(Array.from(cid));
+        if(hasUser){
+          var u = enc.encode(opts.userName);
+          payload = payload.concat([0,u.length]).concat(Array.from(u));
+        }
+        if(hasPass){
+          var p = enc.encode(opts.password);
+          payload = payload.concat([0,p.length]).concat(Array.from(p));
+        }
+
         var rem = var_hdr.length + payload.length;
         var pkt = [16].concat(_encodeLen(rem)).concat(var_hdr).concat(payload);
         ws.send(new Uint8Array(pkt));
@@ -82,7 +99,8 @@ var Paho = (function(){
             self._pingInterval = setInterval(function(){ self._ping(); },30000);
             if(opts.onSuccess) opts.onSuccess();
           } else {
-            if(opts.onFailure) opts.onFailure({errorCode:buf[3]});
+            var CONNACK_MSG = {1:'protokol tidak didukung broker',2:'client ID ditolak',3:'server MQTT tidak tersedia',4:'username/password salah',5:'tidak diotorisasi (cek username/password)'};
+            if(opts.onFailure) opts.onFailure({errorCode:buf[3], errorMessage: CONNACK_MSG[buf[3]] || ('connack code '+buf[3])});
           }
         } else if(type === 3){ /* PUBLISH */
           var msg = _parsePublish(buf);
@@ -503,7 +521,38 @@ var Paho = (function(){
     <div class="field">
       <label>MQTT Broker (untuk tab Monitoring)</label>
       <input type="text" id="cfgBroker" placeholder="test.mosquitto.org">
-      <div class="field-hint">⚠️ Harus SAMA PERSIS dengan MQTT_SERVER di kode ESP32 (sketch.ino / sketch_hardware_asli.ino). Jika beda, Monitoring tidak akan pernah terhubung ke perangkat walau statusnya "Terhubung ke broker".</div>
+      <div class="field-hint">⚠️ Nama host HARUS SAMA PERSIS dengan MQTT_SERVER di kode ESP32 (sketch.ino / sketch_hardware_asli.ino). Port &amp; path WebSocket dicoba OTOMATIS (lihat status koneksi di tab Monitoring) — beberapa broker publik dikenal (test.mosquitto.org, broker.emqx.io, broker.hivemq.com, mqtt.eclipseprojects.io) langsung pakai setelan yang benar. Broker lain akan dicoba beberapa kombinasi port umum secara berurutan.</div>
+    </div>
+    <div class="field" style="margin-bottom:8px;">
+      <span id="advToggle" style="color:var(--accent);font-family:var(--mono);font-size:12px;cursor:pointer;user-select:none;" onclick="toggleAdvanced()">⚙️ Advanced: port / path / username / password ▾</span>
+    </div>
+    <div id="advFields" style="display:none;">
+      <div class="field">
+        <label>Port WebSocket (opsional)</label>
+        <input type="number" id="cfgPort" placeholder="kosongkan = otomatis" inputmode="numeric">
+        <div class="field-hint">Isi HANYA jika kamu tahu persis port WebSocket broker-mu (bukan port 1883/8883 milik ESP32 — itu port MQTT native, beda dengan port WebSocket browser). Contoh umum: 8083/8084 (EMQX), 8000/8884 (HiveMQ), 8080/8081 (Mosquitto).</div>
+      </div>
+      <div class="field">
+        <label>Path WebSocket (opsional)</label>
+        <input type="text" id="cfgPath" placeholder="kosongkan = otomatis (biasanya /mqtt)">
+      </div>
+      <div class="field">
+        <label>Gunakan TLS/SSL (wss://)</label>
+        <select id="cfgUseTLS" style="width:100%;background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:11px 12px;color:var(--text);font-family:var(--mono);font-size:13px;">
+          <option value="auto">Otomatis (disarankan)</option>
+          <option value="yes">Selalu wss:// (TLS)</option>
+          <option value="no">Selalu ws:// (tanpa TLS)</option>
+        </select>
+        <div class="field-hint">Karena app ini dibuka lewat HTTPS (github.io), browser MEMBLOKIR ws:// biasa (mixed content) — kalau broker cuma sediakan ws:// tanpa TLS, app tidak akan pernah bisa konek dari sini, apapun setelan lainnya. Pilih "Otomatis" kecuali kamu yakin butuh override.</div>
+      </div>
+      <div class="field">
+        <label>Username Broker (opsional)</label>
+        <input type="text" id="cfgUser" placeholder="kosongkan jika broker tanpa autentikasi">
+      </div>
+      <div class="field">
+        <label>Password Broker (opsional)</label>
+        <input type="password" id="cfgPass" placeholder="kosongkan jika broker tanpa autentikasi">
+      </div>
     </div>
     <button class="btn btn-primary" onclick="saveSettings()">Simpan Pengaturan</button>
     <button class="btn btn-ghost" onclick="testTelegram()" style="margin-top:8px;">📨 Test Kirim ke Telegram</button>
@@ -530,7 +579,7 @@ let deviceData = {
     if(saved){ const d = JSON.parse(saved); Object.keys(d).forEach(k=>{ if(deviceData[k]) deviceData[k]=d[k]; }); }
   }catch(e){}
 })();
-let settings = {botToken:'', chatId:'', chatIdOwner:'', broker:'test.mosquitto.org'};
+let settings = {botToken:'', chatId:'', chatIdOwner:'', broker:'test.mosquitto.org', port:'', path:'', useTLS:'auto', mqttUser:'', mqttPass:''};
 let scanState = {qrContent:null, device:null, stream:null, scanning:false, attempt:1};
 let prevStatus = {'AC-001':null, 'TV-001':null}; // untuk deteksi transisi ke FAULT
 let mqttIsLive = false; // true hanya kalau MQTT benar-benar terhubung ke broker saat ini
@@ -547,17 +596,49 @@ async function loadSettings(){
   document.getElementById('cfgChatId').value = settings.chatId;
   document.getElementById('cfgChatIdOwner').value = settings.chatIdOwner;
   document.getElementById('cfgBroker').value = settings.broker;
+  document.getElementById('cfgPort').value = settings.port || '';
+  document.getElementById('cfgPath').value = settings.path || '';
+  document.getElementById('cfgUseTLS').value = settings.useTLS || 'auto';
+  document.getElementById('cfgUser').value = settings.mqttUser || '';
+  document.getElementById('cfgPass').value = settings.mqttPass || '';
+  // Buka panel advanced otomatis kalau sebelumnya sudah diisi, supaya tidak "hilang" dari pandangan user
+  if(settings.port || settings.path || settings.mqttUser || (settings.useTLS && settings.useTLS !== 'auto')){
+    document.getElementById('advFields').style.display = 'block';
+    document.getElementById('advToggle').textContent = '⚙️ Advanced: port / path / username / password ▴';
+  }
+}
+function toggleAdvanced(){
+  const el = document.getElementById('advFields');
+  const open = el.style.display !== 'none';
+  el.style.display = open ? 'none' : 'block';
+  document.getElementById('advToggle').textContent = '⚙️ Advanced: port / path / username / password ' + (open ? '▾' : '▴');
 }
 async function saveSettings(){
+  const brokerBaru = document.getElementById('cfgBroker').value.trim() || 'test.mosquitto.org';
+  const portBaru = document.getElementById('cfgPort').value.trim();
+  const pathBaru = document.getElementById('cfgPath').value.trim();
+  const useTLSBaru = document.getElementById('cfgUseTLS').value;
+  const userBaru = document.getElementById('cfgUser').value.trim();
+  const passBaru = document.getElementById('cfgPass').value;
+
+  const brokerConfigBerubah = (brokerBaru !== settings.broker) || (portBaru !== (settings.port||'')) ||
+    (pathBaru !== (settings.path||'')) || (useTLSBaru !== (settings.useTLS||'auto')) ||
+    (userBaru !== (settings.mqttUser||'')) || (passBaru !== (settings.mqttPass||''));
+
   settings.botToken = document.getElementById('cfgBotToken').value.trim();
   settings.chatId = document.getElementById('cfgChatId').value.trim();
   settings.chatIdOwner = document.getElementById('cfgChatIdOwner').value.trim();
-  settings.broker = document.getElementById('cfgBroker').value.trim() || 'test.mosquitto.org';
+  settings.broker = brokerBaru;
+  settings.port = portBaru;
+  settings.path = pathBaru;
+  settings.useTLS = useTLSBaru;
+  settings.mqttUser = userBaru;
+  settings.mqttPass = passBaru;
   try{
     localStorage.setItem('teknisi-app-settings', JSON.stringify(settings));
     showToast('Pengaturan disimpan ✓');
     closeSettings();
-    connectMqtt();
+    if(brokerConfigBerubah) reconnectFresh();
   }catch(e){
     showToast('Gagal menyimpan pengaturan: ' + e.message);
   }
@@ -710,93 +791,230 @@ function timeAgo(ts){
 }
 setInterval(renderCards, 3000);
 
-/* ================= MQTT (Paho, WebSocket) ================= */
+/* ================= MQTT (Paho, WebSocket) - auto-detect utk SEMUA broker ================= */
+/*
+  MASALAH LAMA: port WebSocket (8081) & path (/mqtt) di-hardcode utk SEMUA broker,
+  padahal tiap broker publik pakai port WS yang beda-beda. Jadi begitu broker diganti
+  ke selain test.mosquitto.org, app selalu gagal konek meski hostname sudah benar.
+
+  PERBAIKAN: kalau user tidak mengisi Port/Path manual di Advanced, app akan MENEBAK
+  otomatis - mulai dari preset broker publik yang dikenal, lalu coba beberapa
+  kombinasi port/path umum lainnya secara berurutan sampai salah satu berhasil.
+  Kombinasi yang berhasil disimpan per-host supaya reconnect berikutnya langsung cepat.
+
+  CATATAN PENTING (mixed content): app ini biasanya dibuka lewat HTTPS (github.io).
+  Browser MEMBLOKIR koneksi ws:// (tanpa TLS) dari halaman HTTPS. Karena itu, selama
+  mode TLS = "Otomatis" dan halaman ini HTTPS, hanya kombinasi wss:// yang dicoba -
+  mencoba ws:// di sini cuma buang waktu karena pasti diblokir browser duluan.
+*/
 let mqttClient = null;
+let mqttReconnectTimer = null;
+let mqttCandidates = [];
+let mqttCandidateIdx = 0;
+
+// Port/path WebSocket yang SUDAH DIKETAHUI BENAR untuk broker publik populer (huruf kecil semua)
+const KNOWN_BROKER_PRESETS = {
+  'test.mosquitto.org':       [{port:8081, path:'/mqtt', ssl:true},{port:8080, path:'/mqtt', ssl:false}],
+  'broker.emqx.io':           [{port:8084, path:'/mqtt', ssl:true},{port:8083, path:'/mqtt', ssl:false}],
+  'broker.hivemq.com':        [{port:8884, path:'/mqtt', ssl:true},{port:8000, path:'/mqtt', ssl:false}],
+  'broker.mqttdashboard.com': [{port:8884, path:'/mqtt', ssl:true},{port:8000, path:'/mqtt', ssl:false}],
+  'mqtt.eclipseprojects.io':  [{port:443,  path:'/mqtt', ssl:true},{port:80,   path:'/mqtt', ssl:false}]
+};
+
+// Kombinasi umum yang dicoba berurutan kalau host TIDAK ada di preset di atas
+// (mis. broker self-hosted / VPS Mosquitto sendiri dengan listener websockets aktif)
+const GENERIC_FALLBACK = [
+  {port:8084, path:'/mqtt', ssl:true},
+  {port:8081, path:'/mqtt', ssl:true},
+  {port:8883, path:'/mqtt', ssl:true},
+  {port:443,  path:'/mqtt', ssl:true},
+  {port:8884, path:'/mqtt', ssl:true},
+  {port:9001, path:'/',     ssl:true},
+  {port:8083, path:'/mqtt', ssl:false},
+  {port:8080, path:'/mqtt', ssl:false},
+  {port:8000, path:'/mqtt', ssl:false},
+  {port:80,   path:'/mqtt', ssl:false},
+  {port:1884, path:'/mqtt', ssl:false}
+];
+
+function buildCandidateList(){
+  const host = (settings.broker||'').trim();
+  const manualPort = settings.port ? parseInt(settings.port,10) : null;
+  const manualPath = (settings.path||'').trim();
+  const tlsMode = settings.useTLS || 'auto';
+  const pageIsHttps = (location.protocol === 'https:');
+
+  // User isi Port manual di Advanced -> hormati persis, JANGAN tebak-tebak lagi.
+  if(manualPort){
+    let ssl;
+    if(tlsMode === 'yes') ssl = true;
+    else if(tlsMode === 'no') ssl = false;
+    else ssl = pageIsHttps ? true : [8883,8884,8081,8084,443].includes(manualPort);
+    return [{port:manualPort, path: manualPath || '/mqtt', ssl}];
+  }
+
+  let list = [];
+  // Kombinasi terakhir yang TERBUKTI berhasil untuk host ini -> dicoba duluan (reconnect cepat)
+  try{
+    const cached = JSON.parse(localStorage.getItem('teknisi-mqtt-lastgood-' + host) || 'null');
+    if(cached && cached.port) list.push(cached);
+  }catch(e){}
+
+  const preset = KNOWN_BROKER_PRESETS[host.toLowerCase()];
+  if(preset) list = list.concat(preset);
+  list = list.concat(GENERIC_FALLBACK);
+
+  if(manualPath) list = list.map(c=>({...c, path:manualPath}));
+
+  list = list.filter(c=>{
+    if(tlsMode === 'yes') return c.ssl === true;
+    if(tlsMode === 'no')  return c.ssl === false;
+    if(pageIsHttps) return c.ssl === true; // hindari ws:// yang pasti diblokir mixed-content
+    return true;
+  });
+
+  const seen = new Set();
+  return list.filter(c=>{
+    const k = c.port+'|'+c.path+'|'+c.ssl;
+    if(seen.has(k)) return false;
+    seen.add(k); return true;
+  });
+}
+
+// Dipanggil saat setelan broker/port/path/TLS/kredensial berubah dari Settings
+function reconnectFresh(){
+  if(mqttReconnectTimer) clearTimeout(mqttReconnectTimer);
+  if(mqttClient){ try{ mqttClient.disconnect(); }catch(e){} mqttClient = null; }
+  mqttCandidates = [];
+  mqttCandidateIdx = 0;
+  mqttIsLive = false;
+  connectMqtt();
+}
+
 function connectMqtt(){
-  // Cek dulu apakah library Paho sudah load
   if(typeof Paho === 'undefined' || typeof Paho.MQTT === 'undefined'){
     document.getElementById('mqttStatusText').textContent = 'Memuat library MQTT...';
-    setTimeout(connectMqtt, 1500);
+    mqttReconnectTimer = setTimeout(connectMqtt, 1500);
     return;
   }
+  if(mqttCandidates.length === 0){
+    mqttCandidates = buildCandidateList();
+    mqttCandidateIdx = 0;
+  }
+  if(mqttCandidates.length === 0){
+    document.getElementById('mqttStatusText').textContent =
+      'Tidak ada kombinasi WebSocket yang bisa dicoba — cek setelan TLS di Advanced (halaman ini HTTPS, jadi ws:// tanpa TLS tidak akan pernah bisa dipakai)';
+    mqttReconnectTimer = setTimeout(()=>{ mqttCandidates=[]; connectMqtt(); }, 8000);
+    return;
+  }
+  attemptCandidate();
+}
+
+function attemptCandidate(){
+  const host = settings.broker;
+  const cand = mqttCandidates[mqttCandidateIdx];
+  const protoLabel = cand.ssl ? 'wss' : 'ws';
+  const totalTried = mqttCandidateIdx + 1;
+  document.getElementById('mqttStatusText').textContent =
+    'Mencoba ' + protoLabel + '://' + host + ':' + cand.port + cand.path +
+    (mqttCandidates.length > 1 ? ' (' + totalTried + '/' + mqttCandidates.length + ')' : '') + ' ...';
+
   try{
     const clientId = 'webapp-' + Math.random().toString(16).slice(2,10);
-    mqttClient = new Paho.MQTT.Client(settings.broker, 8081, '/mqtt', clientId);
-    mqttClient.onConnectionLost = ()=>{
+    const client = new Paho.MQTT.Client(host, cand.port, cand.path, clientId);
+    mqttClient = client;
+    client.onConnectionLost = ()=>{
       mqttIsLive = false;
       document.getElementById('mqttDot').classList.remove('live');
       document.getElementById('mqttStatusText').textContent = 'Terputus, mencoba lagi...';
       renderCards();
-      setTimeout(connectMqtt, 4000);
+      mqttCandidates = []; // broker mungkin ganti sisi/proxy -> jalankan auto-detect ulang
+      mqttReconnectTimer = setTimeout(connectMqtt, 4000);
     };
-    mqttClient.onMessageArrived = (msg)=>{
-      const topic = msg.destinationName;
-      const payload = msg.payloadString;
+    client.onMessageArrived = handleMqttMessage;
 
-      // Topic ketersediaan ESP32 (LWT) -> deteksi putus koneksi SECARA INSTAN,
-      // tanpa harus menunggu timeout "belum ada data" di kartu monitoring.
-      if(topic === 'monitoring/system/availability'){
-        if(payload === 'offline'){
-          Object.keys(DEVICES).forEach(id=>{
-            deviceData[id].status = 'OFFLINE';
-            deviceData[id].power_state = 'OFFLINE';
-            prevStatus[id] = null; // reset supaya saat online lagi, status FAULT (jika ada) tetap ter-notifikasi
-          });
-          document.getElementById('mqttStatusText').textContent = 'Terhubung ke broker, tapi ESP32 offline';
-          renderCards();
-        }
-        return;
-      }
-
-      Object.keys(DEVICES).forEach(id=>{
-        const base = DEVICES[id].topicBase;
-        if(topic === base + '/data'){
-          try{
-            const j = JSON.parse(payload);
-            deviceData[id].arus = j.arus ?? deviceData[id].arus;
-            if(j.suhu !== undefined) deviceData[id].suhu = j.suhu;
-            if(j.status){
-              deviceData[id].status = j.status;
-              // Jika abnormal -> FAULT (sudah dikonfirmasi akurat oleh firmware ESP32
-              // selama beberapa siklus baca berturut-turut sebelum dikirim sebagai FAULT):
-              // trigger notifikasi otomatis ke Pemilik & Teknisi.
-              if(j.status === 'FAULT' && prevStatus[id] !== 'FAULT'){
-                sendAutoFaultAlert(id);
-              }
-              prevStatus[id] = j.status;
-            }
-            if(j.power_state) deviceData[id].power_state = j.power_state;
-            deviceData[id].lastUpdate = Date.now();
-            // Simpan ke localStorage supaya data tidak hilang saat refresh
-            try{ localStorage.setItem('teknisi-device-data', JSON.stringify(deviceData)); }catch(e){}
-          }catch(e){}
-        }
-      });
-      renderCards();
-    };
-    mqttClient.connect({
-      useSSL:true,
-      timeout:8,
-      onSuccess:()=>{
+    client.connect({
+      useSSL: cand.ssl,
+      timeout: 6,
+      userName: settings.mqttUser || undefined,
+      password: settings.mqttPass || undefined,
+      onSuccess: ()=>{
         mqttIsLive = true;
-        mqttClient.subscribe('monitoring/#');
+        client.subscribe('monitoring/#');
         document.getElementById('mqttDot').classList.add('live');
-        document.getElementById('mqttStatusText').textContent = 'Terhubung ke ' + settings.broker;
+        document.getElementById('mqttStatusText').textContent =
+          'Terhubung ke ' + host + ' (' + protoLabel + ':' + cand.port + cand.path + ')';
         renderCards();
+        try{ localStorage.setItem('teknisi-mqtt-lastgood-' + host, JSON.stringify(cand)); }catch(e){}
       },
-      onFailure:()=>{
-        mqttIsLive = false;
-        document.getElementById('mqttStatusText').textContent = 'Gagal konek, mencoba lagi...';
-        renderCards();
-        setTimeout(connectMqtt, 5000);
-      }
+      onFailure: (err)=> tryNextCandidateOrRetry(err)
     });
   }catch(e){
-    mqttIsLive = false;
-    document.getElementById('mqttStatusText').textContent = 'Error: ' + e.message + ' — mencoba lagi...';
-    renderCards();
-    setTimeout(connectMqtt, 5000);
+    tryNextCandidateOrRetry({errorMessage:e.message});
   }
+}
+
+function tryNextCandidateOrRetry(err){
+  mqttIsLive = false;
+  renderCards();
+  mqttCandidateIdx++;
+  if(mqttCandidateIdx < mqttCandidates.length){
+    // Langsung coba kombinasi berikutnya, tanpa jeda lama, supaya auto-detect terasa cepat
+    mqttReconnectTimer = setTimeout(attemptCandidate, 250);
+  } else {
+    const pesanErr = (err && err.errorMessage) ? (' — ' + err.errorMessage) : '';
+    document.getElementById('mqttStatusText').textContent =
+      'Gagal konek ke semua kombinasi port untuk "' + settings.broker + '"' + pesanErr + '. Mencoba lagi...';
+    mqttCandidates = [];
+    mqttCandidateIdx = 0;
+    mqttReconnectTimer = setTimeout(connectMqtt, 6000);
+  }
+}
+
+function handleMqttMessage(msg){
+  const topic = msg.destinationName;
+  const payload = msg.payloadString;
+
+  // Topic ketersediaan ESP32 (LWT) -> deteksi putus koneksi SECARA INSTAN,
+  // tanpa harus menunggu timeout "belum ada data" di kartu monitoring.
+  if(topic === 'monitoring/system/availability'){
+    if(payload === 'offline'){
+      Object.keys(DEVICES).forEach(id=>{
+        deviceData[id].status = 'OFFLINE';
+        deviceData[id].power_state = 'OFFLINE';
+        prevStatus[id] = null; // reset supaya saat online lagi, status FAULT (jika ada) tetap ter-notifikasi
+      });
+      document.getElementById('mqttStatusText').textContent = 'Terhubung ke broker, tapi ESP32 offline';
+      renderCards();
+    }
+    return;
+  }
+
+  Object.keys(DEVICES).forEach(id=>{
+    const base = DEVICES[id].topicBase;
+    if(topic === base + '/data'){
+      try{
+        const j = JSON.parse(payload);
+        deviceData[id].arus = j.arus ?? deviceData[id].arus;
+        if(j.suhu !== undefined) deviceData[id].suhu = j.suhu;
+        if(j.status){
+          deviceData[id].status = j.status;
+          // Jika abnormal -> FAULT (sudah dikonfirmasi akurat oleh firmware ESP32
+          // selama beberapa siklus baca berturut-turut sebelum dikirim sebagai FAULT):
+          // trigger notifikasi otomatis ke Pemilik & Teknisi.
+          if(j.status === 'FAULT' && prevStatus[id] !== 'FAULT'){
+            sendAutoFaultAlert(id);
+          }
+          prevStatus[id] = j.status;
+        }
+        if(j.power_state) deviceData[id].power_state = j.power_state;
+        deviceData[id].lastUpdate = Date.now();
+        // Simpan ke localStorage supaya data tidak hilang saat refresh
+        try{ localStorage.setItem('teknisi-device-data', JSON.stringify(deviceData)); }catch(e){}
+      }catch(e){}
+    }
+  });
+  renderCards();
 }
 
 /* ================= NOTIFIKASI OTOMATIS (Jika Abnormal -> FAULT) ================= */
