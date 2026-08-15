@@ -1501,8 +1501,30 @@ function showError(text){
 if('serviceWorker' in navigator){
   window.addEventListener('load', ()=>{
     navigator.serviceWorker.register('sw.js')
-      .then(()=> console.log('SW registered'))
+      .then(reg=>{
+        console.log('SW registered');
+        // Kalau ada versi SW baru ketemu, minta dia langsung aktif (tidak nunggu semua tab ditutup)
+        reg.addEventListener('updatefound', ()=>{
+          const baru = reg.installing;
+          if(!baru) return;
+          baru.addEventListener('statechange', ()=>{
+            if(baru.state === 'installed' && navigator.serviceWorker.controller){
+              console.log('Versi baru terpasang, akan reload...');
+            }
+          });
+        });
+      })
       .catch(e=> console.log('SW error:', e));
+
+    // Begitu SW baru resmi ambil alih kontrol halaman -> reload SEKALI otomatis
+    // supaya update selanjutnya (index.html/sw.js) langsung kepakai tanpa user
+    // perlu tahu apa-apa soal cache/service worker.
+    let sudahReload = false;
+    navigator.serviceWorker.addEventListener('controllerchange', ()=>{
+      if(sudahReload) return;
+      sudahReload = true;
+      window.location.reload();
+    });
   });
 }
 </script>
