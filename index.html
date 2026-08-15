@@ -229,6 +229,14 @@ var Paho = (function(){
   .card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--card-color,var(--off));}
   .card-stale{opacity:.5;filter:grayscale(.5);transition:opacity .3s,filter .3s;}
   .stale-badge{color:var(--maint);font-weight:700;}
+  .pwr-badge{font-family:var(--mono);font-size:12px;font-weight:700;padding:2px 8px;border-radius:6px;display:inline-flex;align-items:center;gap:5px;}
+  .pwr-badge::before{content:'';width:7px;height:7px;border-radius:50%;background:currentColor;}
+  .pwr-on{background:rgba(52,211,153,.14);color:var(--ok);}
+  .pwr-off{background:rgba(91,103,115,.18);color:var(--off);}
+  .pwr-offline{background:rgba(239,68,68,.14);color:var(--fault);}
+  .pwr-since{font-size:9px;color:var(--text-faint);font-family:var(--mono);margin-top:2px;}
+  @keyframes pwrFlash{0%{box-shadow:0 0 0 0 currentColor;}70%{box-shadow:0 0 0 8px transparent;}100%{box-shadow:0 0 0 0 transparent;}}
+  .pwr-flash{animation:pwrFlash .8s ease-out 2;}
   .card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
   .card-title{display:flex;align-items:center;gap:10px;}
   .indicator{width:14px;height:14px;border-radius:50%;background:var(--card-color,var(--off));box-shadow:0 0 12px var(--card-color,transparent);flex-shrink:0;}
@@ -523,6 +531,10 @@ var Paho = (function(){
       <input type="text" id="cfgBroker" placeholder="test.mosquitto.org">
       <div class="field-hint">⚠️ Nama host HARUS SAMA PERSIS dengan MQTT_SERVER di kode ESP32 (sketch.ino / sketch_hardware_asli.ino). Port &amp; path WebSocket dicoba OTOMATIS (lihat status koneksi di tab Monitoring) — beberapa broker publik dikenal (test.mosquitto.org, broker.emqx.io, broker.hivemq.com, mqtt.eclipseprojects.io) langsung pakai setelan yang benar. Broker lain akan dicoba beberapa kombinasi port umum secara berurutan.</div>
     </div>
+    <div class="field" style="background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:11px 12px;">
+      <label style="margin-bottom:4px;">🧪 Uji coba di Wokwi</label>
+      <div class="field-hint" style="margin-top:0;">Simulasi ESP32 sekarang pakai TOMBOL TEKAN (bukan saklar geser) di diagram.json: <b>ON/OFF AC-001 / TV-001</b> untuk memaksa perangkat mati/nyala, dan <b>SIMULASI RUSAK AC-001 / TV-001</b> untuk memicu status FAULT seketika (tanpa nunggu) — cocok untuk uji notifikasi Telegram di sini. Tekan sekali untuk aktifkan, tekan lagi untuk lepas. Pastikan tab ini (Monitoring) sedang terhubung ke broker yang sama dengan yang diisi di sketch.ino supaya perubahannya langsung kelihatan di kartu perangkat.</div>
+    </div>
     <div class="field" style="margin-bottom:8px;">
       <span id="advToggle" style="color:var(--accent);font-family:var(--mono);font-size:12px;cursor:pointer;user-select:none;" onclick="toggleAdvanced()">⚙️ Advanced: port / path / username / password ▾</span>
     </div>
@@ -569,8 +581,8 @@ const DEVICES = {
   'TV-001': {room:'RUANG_B', label:'TV-001', maxArus:4, hasSuhu:false, topicBase:'monitoring/RUANG_B/TV-001'}
 };
 let deviceData = {
-  'AC-001': {arus:0, suhu:null, status:'OFF', power_state:'OFF', lastUpdate:null},
-  'TV-001': {arus:0, suhu:null, status:'OFF', power_state:'OFF', lastUpdate:null}
+  'AC-001': {arus:0, suhu:null, status:'OFF', power_state:'OFF', lastUpdate:null, powerChangedAt:null},
+  'TV-001': {arus:0, suhu:null, status:'OFF', power_state:'OFF', lastUpdate:null, powerChangedAt:null}
 };
 // Load data terakhir dari localStorage supaya tidak hilang saat refresh
 (function(){
@@ -704,6 +716,20 @@ function gaugeSVG(id, pct, color){
   </svg>`;
 }
 
+function pwrBadgeClass(state){
+  if(state === 'ON') return 'pwr-on';
+  if(state === 'OFFLINE') return 'pwr-offline';
+  return 'pwr-off'; // OFF (default)
+}
+function pwrSinceText(ts){
+  if(!ts) return '';
+  const s = Math.floor((Date.now()-ts)/1000);
+  if(s < 5) return 'baru saja';
+  if(s < 60) return 'sejak '+s+'dtk lalu';
+  if(s < 3600) return 'sejak '+Math.floor(s/60)+'m lalu';
+  return 'sejak '+Math.floor(s/3600)+'j lalu';
+}
+
 /* ================= RENDER MONITORING ================= */
 let cardsBuilt = false;
 function renderCards(){
@@ -736,7 +762,7 @@ function renderCards(){
           <div class="readouts">
             ${d.hasSuhu ? `<div class="ro"><div class="ro-label">Suhu</div><div class="ro-val" id="suhu-${id}">${data.suhu!==null?data.suhu.toFixed(1)+'°C':'-'}</div></div>` : `<div class="ro"><div class="ro-label">Suhu</div><div class="ro-val">N/A</div></div>`}
             <div class="ro"><div class="ro-label">Daya</div><div class="ro-val" id="daya-${id}">≈${daya}W</div></div>
-            <div class="ro"><div class="ro-label">Power</div><div class="ro-val" id="pwr-${id}">${data.power_state}</div></div>
+            <div class="ro"><div class="ro-label">Power</div><div class="ro-val"><span class="pwr-badge ${pwrBadgeClass(data.power_state)}" id="pwr-${id}" data-pwr="${data.power_state}">${data.power_state}</span><div class="pwr-since" id="pwrsince-${id}">${pwrSinceText(data.powerChangedAt)}</div></div></div>
             <div class="ro"><div class="ro-label">Arus</div><div class="ro-val" id="arus2-${id}">${data.arus.toFixed(2)}A</div></div>
           </div>
         </div>
@@ -778,9 +804,23 @@ function renderCards(){
     if(el('gval'))  el('gval').textContent  = data.arus.toFixed(2)+'A';
     if(el('suhu'))  el('suhu').textContent  = data.suhu!==null ? data.suhu.toFixed(1)+'°C' : '-';
     if(el('daya'))  el('daya').textContent  = '≈'+daya+'W';
-    if(el('pwr'))   el('pwr').textContent   = data.power_state;
     if(el('arus2')) el('arus2').textContent = data.arus.toFixed(2)+'A';
     if(el('upd'))   el('upd').innerHTML     = 'update: '+lastUpd+staleNote;
+
+    // Badge Power real-time: ganti warna & PULSE tiap kali status ON/OFF benar-benar
+    // berubah (bukan cuma re-render biasa tiap 3 detik), supaya perubahan ON<->OFF
+    // langsung kelihatan jelas begitu terjadi.
+    const pwrEl = el('pwr');
+    if(pwrEl && pwrEl.dataset.pwr !== data.power_state){
+      pwrEl.classList.remove('pwr-on','pwr-off','pwr-offline');
+      pwrEl.classList.add(pwrBadgeClass(data.power_state));
+      pwrEl.textContent = data.power_state;
+      pwrEl.dataset.pwr = data.power_state;
+      pwrEl.classList.remove('pwr-flash');
+      void pwrEl.offsetWidth; // paksa reflow supaya animasi bisa retrigger
+      pwrEl.classList.add('pwr-flash');
+    }
+    if(el('pwrsince')) el('pwrsince').textContent = pwrSinceText(data.powerChangedAt);
   });
 }
 function timeAgo(ts){
@@ -980,6 +1020,7 @@ function handleMqttMessage(msg){
   if(topic === 'monitoring/system/availability'){
     if(payload === 'offline'){
       Object.keys(DEVICES).forEach(id=>{
+        if(deviceData[id].power_state !== 'OFFLINE') deviceData[id].powerChangedAt = Date.now();
         deviceData[id].status = 'OFFLINE';
         deviceData[id].power_state = 'OFFLINE';
         prevStatus[id] = null; // reset supaya saat online lagi, status FAULT (jika ada) tetap ter-notifikasi
@@ -1006,6 +1047,11 @@ function handleMqttMessage(msg){
             sendAutoFaultAlert(id);
           }
           prevStatus[id] = j.status;
+        }
+        if(j.power_state && j.power_state !== deviceData[id].power_state){
+          // Catat KAPAN power_state benar-benar berubah (ON<->OFF) supaya app bisa
+          // menampilkan info real-time "sejak X detik lalu" & memicu animasi highlight.
+          deviceData[id].powerChangedAt = Date.now();
         }
         if(j.power_state) deviceData[id].power_state = j.power_state;
         deviceData[id].lastUpdate = Date.now();
